@@ -1716,6 +1716,72 @@ def get_recent_quercus_items(limit=100):
         return [dict(row) for row in cursor.fetchall()]
 
 
+def ignore_past_quercus_intake_items(today=None):
+    today = _clean_candidate_date(today or date.today())
+    now = datetime.now().isoformat(timespec="seconds")
+    quercus_task_sources = (
+        "quercus_assignment",
+        "quercus_calendar",
+        "quercus_upcoming",
+        "quercus_todo",
+    )
+    quercus_external_sources = (
+        "canvas_assignment",
+        "quercus_assignment",
+        "quercus_calendar",
+        "quercus_upcoming",
+        "quercus_todo",
+    )
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            UPDATE tasks
+            SET status = 'ignored',
+                needs_review = 0,
+                urgency_score = 0,
+                urgency_label = 'low',
+                last_scored_at = ?,
+                updated_at = ?
+            WHERE status NOT IN ('done', 'ignored')
+              AND due_at IS NOT NULL
+              AND due_at < ?
+              AND (
+                  source IN ({','.join('?' for _ in quercus_task_sources)})
+                  OR external_source IN ({','.join('?' for _ in quercus_external_sources)})
+              )
+            ''',
+            (
+                now,
+                now,
+                today,
+                *quercus_task_sources,
+                *quercus_external_sources,
+            ),
+        )
+        tasks_ignored = cursor.rowcount
+
+        cursor.execute(
+            '''
+            UPDATE task_candidates
+            SET decision_status = 'ignored',
+                updated_at = ?
+            WHERE decision_status = 'pending'
+              AND due_at IS NOT NULL
+              AND due_at < ?
+            ''',
+            (now, today),
+        )
+        candidates_ignored = cursor.rowcount
+        conn.commit()
+
+    return {
+        "tasks_ignored": tasks_ignored,
+        "candidates_ignored": candidates_ignored,
+    }
+
+
 def delete_task(task_id):
     with closing(_connect()) as conn:
         cursor = conn.cursor()

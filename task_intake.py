@@ -50,6 +50,19 @@ def _clean_date(value):
     return candidate
 
 
+def _date_value(value):
+    cleaned = _clean_date(value)
+    if not cleaned:
+        return None
+    return datetime.strptime(cleaned, "%Y-%m-%d").date()
+
+
+def _is_past_due(candidate, today=None):
+    today = today or date.today()
+    due_date = _date_value(candidate.get("due_at"))
+    return due_date is not None and due_date < today
+
+
 def _short_text_from_html(value):
     text = _clean_text(value)
     if not text:
@@ -178,6 +191,7 @@ def _empty_summary():
         "suggested_tasks_created": 0,
         "pending_candidates_created": 0,
         "duplicates_skipped": 0,
+        "skipped_past_due": 0,
         "tasks_rescored": 0,
         "errors": [],
     }
@@ -185,6 +199,10 @@ def _empty_summary():
 
 def _handle_candidate(candidate, summary):
     summary["candidates_found"] += 1
+    if _is_past_due(candidate):
+        summary["skipped_past_due"] += 1
+        return
+
     candidate_id = create_task_candidate(candidate)
     if candidate_id is None:
         summary["duplicates_skipped"] += 1

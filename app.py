@@ -42,6 +42,7 @@ from db import (
     get_tasks_by_status,
     get_this_week_tasks,
     get_today_tasks,
+    ignore_past_quercus_intake_items,
     init_db,
     promote_candidate_to_task,
     rescore_all_active_tasks,
@@ -869,7 +870,7 @@ def render_quercus_sync():
 
 def render_intake_summary(summary):
     st.markdown("### Intake Summary")
-    columns = st.columns(5)
+    columns = st.columns(6)
     columns[0].metric("Candidates Found", summary["candidates_found"])
     columns[1].metric(
         "Confirmed Created",
@@ -878,6 +879,7 @@ def render_intake_summary(summary):
     columns[2].metric("Suggested Created", summary["suggested_tasks_created"])
     columns[3].metric("Pending", summary["pending_candidates_created"])
     columns[4].metric("Duplicates", summary["duplicates_skipped"])
+    columns[5].metric("Past Due Skipped", summary.get("skipped_past_due", 0))
     st.markdown(f"**Tasks rescored:** {summary['tasks_rescored']}")
 
     if summary["errors"]:
@@ -905,6 +907,24 @@ def render_task_intake_controls():
 
     if st.session_state.get("latest_intake_summary"):
         render_intake_summary(st.session_state.latest_intake_summary)
+
+
+def render_past_quercus_cleanup():
+    st.markdown("### Past Quercus Cleanup")
+    st.caption(
+        "Auto Intake now skips Quercus/Canvas items with due dates before today. "
+        "Use this only if you want to hide old Quercus imports that were already "
+        "created before this rule existed."
+    )
+
+    if st.button("Ignore Past Quercus Imports"):
+        result = ignore_past_quercus_intake_items(date.today())
+        st.success(
+            "Cleanup finished. "
+            f"Ignored {result['tasks_ignored']} old tasks and "
+            f"{result['candidates_ignored']} old pending candidates."
+        )
+        st.rerun()
 
 
 def render_candidate_fields(candidate):
@@ -1041,6 +1061,7 @@ def render_rescore_tasks():
 def render_task_intake():
     st.subheader("Task Intake")
     render_task_intake_controls()
+    render_past_quercus_cleanup()
     render_pending_task_candidates()
     render_top_urgent_tasks()
     render_rescore_tasks()
