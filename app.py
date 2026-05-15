@@ -20,6 +20,12 @@ from canvas_client import (
     has_canvas_api_token,
     has_canvas_base_url,
 )
+from conversation_intake import (
+    ConversationIntakeConfigError,
+    ConversationIntakeResponseError,
+    has_openai_api_key as has_conversation_intake_api_key,
+    parse_conversation_message,
+)
 from daily_command import (
     DailyCommandConfigError,
     DailyCommandResponseError,
@@ -40,6 +46,7 @@ from db import (
     create_agent_memory,
     create_agent_memory_candidate,
     create_checkin_answer,
+    create_command_center_message,
     create_or_update_morning_checkin,
     create_or_update_daily_review,
     create_personal_commitment,
@@ -59,6 +66,7 @@ from db import (
     get_course_summaries,
     get_morning_checkin_by_date,
     get_pending_agent_memory_candidates,
+    get_recent_command_center_messages,
     memory_exists,
     get_personal_commitments_for_date,
     get_task_candidates,
@@ -77,6 +85,7 @@ from db import (
     save_daily_command,
     save_ai_boss_briefing,
     create_or_update_daily_command_review,
+    mark_command_center_message_applied,
     promote_memory_candidate_to_memory,
     unarchive_course,
     update_agent_memory_candidate_decision,
@@ -94,6 +103,7 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 EXPORT_DIR = BASE_DIR / "data" / "exports"
 
 MENU_OPTIONS = [
+    "Command Center",
     "Daily Command",
     "Feedback Loop",
     "Today Plan",
@@ -735,6 +745,436 @@ def render_ai_boss():
     render_ai_boss_generate(context, task_lookup)
     render_latest_ai_boss_briefing(task_lookup)
     render_recent_ai_boss_briefings()
+
+
+def compact_proposal_dict(values):
+    return {
+        key: value for key, value in values.items()
+        if value not in (None, "", [])
+    }
+
+
+def append_text(existing, addition):
+    existing = str(existing or "").strip()
+    addition = str(addition or "").strip()
+    if not addition:
+        return existing or None
+    if not existing:
+        return addition
+    if addition.casefold() in existing.casefold():
+        return existing
+    return f"{existing}\n{addition}"
+
+
+def merge_checkin_with_updates(command_date, updates):
+    existing = get_morning_checkin_by_date(command_date) or {}
+    merged = {
+        "checkin_date": command_date,
+        "available_study_minutes": existing.get("available_study_minutes"),
+        "available_time_blocks": existing.get("available_time_blocks"),
+        "fixed_commitments": existing.get("fixed_commitments"),
+        "extra_commitments": existing.get("extra_commitments"),
+        "sleep_quality": existing.get("sleep_quality"),
+        "energy_level": existing.get("energy_level"),
+        "stress_level": existing.get("stress_level"),
+        "mood": existing.get("mood"),
+        "top_personal_priority": existing.get("top_personal_priority"),
+        "avoiding_task": existing.get("avoiding_task"),
+        "hard_stop_time": existing.get("hard_stop_time"),
+        "notes": existing.get("notes"),
+    }
+    append_fields = {
+        "available_time_blocks",
+        "fixed_commitments",
+        "extra_commitments",
+        "notes",
+    }
+    for key, value in updates.items():
+        if value in (None, ""):
+            continue
+        if key in append_fields:
+            merged[key] = append_text(merged.get(key), value)
+        else:
+            merged[key] = value
+    return create_or_update_morning_checkin(merged)
+
+
+def merge_daily_review_with_update(command_date, updates):
+    existing = get_daily_review_by_date(command_date) or {}
+    merged = {
+        "review_date": command_date,
+        "completed_summary": existing.get("completed_summary"),
+        "missed_tasks": existing.get("missed_tasks"),
+        "blockers": existing.get("blockers"),
+        "avoidance_notes": existing.get("avoidance_notes"),
+        "tomorrow_top_priority": existing.get("tomorrow_top_priority"),
+        "mood_energy": existing.get("mood_energy"),
+        "focus_rating": existing.get("focus_rating"),
+    }
+    append_fields = {
+        "completed_summary",
+        "missed_tasks",
+        "blockers",
+        "avoidance_notes",
+    }
+    for key, value in updates.items():
+        if value in (None, ""):
+            continue
+        if key in append_fields:
+            merged[key] = append_text(merged.get(key), value)
+        else:
+            merged[key] = value
+    return create_or_update_daily_review(merged)
+
+
+def proposal_has_content(proposal):
+    if not proposal:
+        return False
+    morning_updates = compact_proposal_dict(
+        proposal.get("morning_checkin_updates") or {}
+    )
+    daily_review_update = compact_proposal_dict(
+        proposal.get("daily_review_update") or {}
+    )
+    return any([
+        morning_updates,
+        proposal.get("personal_commitments"),
+        daily_review_update,
+        proposal.get("memory_candidates"),
+    ])
+
+
+def apply_conversation_proposal(command_date, proposal):
+    result = {
+        "morning_checkin_updated": False,
+        "personal_commitments_created": 0,
+        "daily_review_updated": False,
+        "memory_candidates_created": 0,
+        "memory_candidates_skipped": 0,
+    }
+
+    morning_updates = compact_proposal_dict(
+        proposal.get("morning_checkin_updates") or {}
+    )
+    if morning_updates:
+        merge_checkin_with_updates(command_date, morning_updates)
+        result["morning_checkin_updated"] = True
+
+    for commitment in proposal.get("personal_commitments") or []:
+        create_personal_commitment({
+            "title": commitment.get("title"),
+            "commitment_type": commitment.get("commitment_type") or "other",
+            "planned_date": commitment.get("planned_date") or command_date,
+            "start_time": commitment.get("start_time"),
+            "estimated_minutes": commitment.get("estimated_minutes"),
+            "priority": commitment.get("priority") or 3,
+            "status": "planned",
+            "notes": commitment.get("notes"),
+        })
+        result["personal_commitments_created"] += 1
+
+    daily_review_update = compact_proposal_dict(
+        proposal.get("daily_review_update") or {}
+    )
+    if daily_review_update:
+        merge_daily_review_with_update(command_date, daily_review_update)
+        result["daily_review_updated"] = True
+
+    for candidate in proposal.get("memory_candidates") or []:
+        candidate_id = create_agent_memory_candidate({
+            "memory_type": candidate.get("memory_type"),
+            "memory_key": candidate.get("memory_key"),
+            "memory_value": candidate.get("memory_value"),
+            "confidence": candidate.get("confidence") or "medium",
+            "source": "command_center",
+            "evidence_json": json.dumps({
+                "source": "command_center",
+                "evidence": candidate.get("evidence"),
+                "command_date": command_date,
+            }, ensure_ascii=False),
+            "decision_status": "pending",
+        })
+        if candidate_id:
+            result["memory_candidates_created"] += 1
+        else:
+            result["memory_candidates_skipped"] += 1
+
+    return result
+
+
+def proposal_field_rows(values):
+    return compact_proposal_dict(values or {}).items()
+
+
+def render_conversation_proposal(proposal):
+    if not proposal:
+        return
+
+    st.markdown("### AI Proposal")
+    st.markdown(f"**Summary**  \n{display_value(proposal.get('summary'))}")
+    st.markdown(f"**Confidence**  \n{display_value(proposal.get('confidence'))}")
+
+    morning_updates = list(proposal_field_rows(
+        proposal.get("morning_checkin_updates")
+    ))
+    if morning_updates:
+        st.markdown("#### Morning Check-In Updates")
+        for key, value in morning_updates:
+            st.markdown(f"- **{key}:** {display_value(value)}")
+
+    commitments = proposal.get("personal_commitments") or []
+    if commitments:
+        st.markdown("#### Personal Commitments")
+        for commitment in commitments:
+            with st.container(border=True):
+                st.markdown(f"**{display_value(commitment.get('title'))}**")
+                columns = st.columns(4)
+                columns[0].markdown(
+                    f"**Type**  \n{display_value(commitment.get('commitment_type'))}"
+                )
+                columns[1].markdown(
+                    f"**Date**  \n{display_value(commitment.get('planned_date'))}"
+                )
+                columns[2].markdown(
+                    f"**Start**  \n{display_value(commitment.get('start_time'))}"
+                )
+                columns[3].markdown(
+                    "**Minutes**  \n"
+                    f"{display_value(commitment.get('estimated_minutes'))}"
+                )
+                st.markdown(f"**Notes**  \n{display_value(commitment.get('notes'))}")
+
+    daily_review_update = list(proposal_field_rows(
+        proposal.get("daily_review_update")
+    ))
+    if daily_review_update:
+        st.markdown("#### Daily Review Update")
+        for key, value in daily_review_update:
+            st.markdown(f"- **{key}:** {display_value(value)}")
+
+    status_suggestions = proposal.get("task_status_suggestions") or []
+    if status_suggestions:
+        st.markdown("#### Task Status Suggestions")
+        st.caption("These are suggestions only. They are not applied automatically.")
+        for suggestion in status_suggestions:
+            with st.container(border=True):
+                st.markdown(f"**{display_value(suggestion.get('title'))}**")
+                st.markdown(
+                    "**Suggested status**  \n"
+                    f"{display_value(suggestion.get('suggested_status'))}"
+                )
+                st.markdown(f"**Reason**  \n{display_value(suggestion.get('reason'))}")
+
+    memory_candidates = proposal.get("memory_candidates") or []
+    if memory_candidates:
+        st.markdown("#### Memory Candidates")
+        st.caption("These become pending memory candidates, not active memory.")
+        for candidate in memory_candidates:
+            with st.container(border=True):
+                st.markdown(
+                    f"**{display_value(candidate.get('memory_type'))}: "
+                    f"{display_value(candidate.get('memory_key'))}**"
+                )
+                st.markdown(display_value(candidate.get("memory_value")))
+                st.caption(display_value(candidate.get("evidence")))
+
+    questions = proposal.get("clarification_questions") or []
+    if questions:
+        st.markdown("#### Clarification Questions")
+        for question in questions:
+            st.markdown(f"- {display_value(question)}")
+
+
+def render_command_center_top_tasks(tasks):
+    st.markdown("### Now")
+    latest = get_latest_daily_command(date.today().isoformat())
+    if latest:
+        command = parse_saved_daily_command(latest)
+        if command:
+            st.markdown(f"**Daily Command:** {display_value(command.get('executive_summary'))}")
+            st.caption(
+                "First 25 minutes: "
+                f"{display_value(command.get('first_25_minute_action'))}"
+            )
+    else:
+        st.info("No Daily Command saved for today yet.")
+
+    active_session = get_active_study_session()
+    if active_session:
+        st.warning(
+            "Active focus session: "
+            f"{active_session['task_title']} "
+            f"({elapsed_minutes_since(active_session['start_time'])} min elapsed)."
+        )
+
+    st.markdown("### Top Tasks")
+    top_tasks = top_urgent_tasks(limit=3)
+    if not top_tasks:
+        st.info("No active tasks right now.")
+        return
+
+    for index, task in enumerate(top_tasks, start=1):
+        urgency_score, urgency_label = task_urgency(task)
+        with st.container(border=True):
+            st.markdown(f"#### {index}. {display_value(task['title'])}")
+            columns = st.columns(4)
+            columns[0].markdown(f"**Course**  \n{display_value(task['course'])}")
+            columns[1].markdown(f"**Due**  \n{display_value(task['due_at'])}")
+            columns[2].markdown(f"**Status**  \n{display_value(task['status'])}")
+            columns[3].markdown(
+                f"**Urgency**  \n{display_value(urgency_label)} ({urgency_score:.1f})"
+            )
+            if not active_session and st.button(
+                "Start Focus",
+                key=f"command-center-start-focus-{task['id']}",
+            ):
+                try:
+                    start_focus_session_for_task(task)
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    st.success("Focus session started.")
+                    st.rerun()
+
+
+def render_command_center_conversation(command_date, context):
+    st.markdown("### Conversation Intake")
+    st.caption(
+        "Tell the AI what is happening. It will create a proposal first; you "
+        "choose whether to apply it."
+    )
+
+    key_present = has_conversation_intake_api_key()
+    if not key_present:
+        st.warning("Add OPENAI_API_KEY to your .env file to use conversation intake.")
+
+    with st.form("command_center_message_form"):
+        message = st.text_area(
+            "Message",
+            placeholder=(
+                "Example: I slept 5 hours, feel tired, have class at 2, "
+                "gym at 6, and can study 2 hours. I finished the CLA reading."
+            ),
+            height=140,
+        )
+        submitted = st.form_submit_button("Analyze Message", disabled=not key_present)
+
+    if submitted:
+        recent_messages = get_recent_command_center_messages(command_date, limit=5)
+        with st.spinner("Parsing message into a proposal..."):
+            try:
+                proposal = parse_conversation_message(
+                    message,
+                    context,
+                    recent_messages=recent_messages,
+                )
+            except (ConversationIntakeConfigError, ValueError) as error:
+                st.error(str(error))
+                return
+            except ConversationIntakeResponseError as error:
+                st.error(str(error))
+                if error.raw_response:
+                    st.text_area(
+                        "Raw AI response",
+                        value=error.raw_response,
+                        height=220,
+                    )
+                return
+            except Exception as error:
+                st.error(f"Could not parse message: {error}")
+                return
+
+        proposal_for_save = {
+            key: value for key, value in proposal.items()
+            if key != "_raw_response"
+        }
+        message_id = create_command_center_message(
+            command_date,
+            "user",
+            message,
+            proposal_json=json.dumps(proposal_for_save, ensure_ascii=False),
+            applied=0,
+        )
+        st.session_state.command_center_proposal = proposal_for_save
+        st.session_state.command_center_message_id = message_id
+        st.success("Proposal ready. Review it before applying.")
+
+    proposal = st.session_state.get("command_center_proposal")
+    if proposal:
+        render_conversation_proposal(proposal)
+        columns = st.columns(2)
+        with columns[0]:
+            if st.button(
+                "Apply Proposal",
+                disabled=not proposal_has_content(proposal),
+            ):
+                try:
+                    result = apply_conversation_proposal(command_date, proposal)
+                    message_id = st.session_state.get("command_center_message_id")
+                    if message_id:
+                        mark_command_center_message_applied(message_id)
+                except ValueError as error:
+                    st.error(str(error))
+                    return
+                st.success(
+                    "Applied proposal. "
+                    f"Morning check-in updated: {result['morning_checkin_updated']}; "
+                    f"commitments created: {result['personal_commitments_created']}; "
+                    f"daily review updated: {result['daily_review_updated']}; "
+                    f"memory candidates created: {result['memory_candidates_created']}."
+                )
+                st.session_state.pop("command_center_proposal", None)
+                st.session_state.pop("command_center_message_id", None)
+                st.rerun()
+        with columns[1]:
+            if st.button("Discard Proposal"):
+                st.session_state.pop("command_center_proposal", None)
+                st.session_state.pop("command_center_message_id", None)
+                st.rerun()
+
+
+def render_command_center_history(command_date):
+    messages = get_recent_command_center_messages(command_date, limit=8)
+    if not messages:
+        return
+
+    st.markdown("### Recent Conversation")
+    for message in messages:
+        with st.expander(
+            f"{display_datetime(message['created_at'])} - "
+            f"{display_value(message['role'])}"
+        ):
+            st.write(message["content"])
+            if message.get("proposal_json"):
+                st.caption("Proposal saved with this message.")
+            if message.get("applied"):
+                st.success("Applied")
+
+
+def render_command_center_quick_command(context, task_lookup):
+    st.markdown("### Daily Command")
+    render_daily_command_status(context)
+    render_daily_command_generate(context, task_lookup)
+
+
+def render_command_center():
+    st.subheader("Command Center")
+    st.info(
+        "This is the main daily入口: talk naturally, review the AI proposal, "
+        "then apply only what you approve."
+    )
+    command_date = date.today().isoformat()
+    context, tasks = current_daily_command_context(command_date)
+    task_lookup = task_lookup_by_id(tasks)
+
+    render_command_center_top_tasks(tasks)
+    render_command_center_conversation(command_date, context)
+
+    refreshed_context, refreshed_tasks = current_daily_command_context(command_date)
+    refreshed_lookup = task_lookup_by_id(refreshed_tasks)
+    render_command_center_quick_command(refreshed_context, refreshed_lookup)
+    render_latest_daily_command(command_date, refreshed_lookup)
+    render_command_center_history(command_date)
 
 
 def checkin_text_value(checkin, key):
@@ -2442,7 +2882,9 @@ def main():
 
     choice = st.sidebar.selectbox("Menu", MENU_OPTIONS)
 
-    if choice == "Daily Command":
+    if choice == "Command Center":
+        render_command_center()
+    elif choice == "Daily Command":
         render_daily_command()
     elif choice == "Feedback Loop":
         render_feedback_loop()

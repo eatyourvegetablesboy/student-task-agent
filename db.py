@@ -379,6 +379,21 @@ def _create_checkin_answers_table(cursor):
     ''')
 
 
+def _create_command_center_messages_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS command_center_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            message_date TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            proposal_json TEXT,
+            applied INTEGER DEFAULT 0 CHECK (applied IN (0, 1)),
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
 def _table_columns(cursor, table_name):
     cursor.execute(f"PRAGMA table_info({table_name})")
     return [row["name"] for row in cursor.fetchall()]
@@ -443,6 +458,10 @@ def _database_needs_backup_before_init():
             "agent_memory_candidates",
         )
         checkin_answers_missing = not _table_exists(cursor, "checkin_answers")
+        command_center_messages_missing = not _table_exists(
+            cursor,
+            "command_center_messages",
+        )
         return (
             tasks_need_migration
             or daily_reviews_missing
@@ -456,6 +475,7 @@ def _database_needs_backup_before_init():
             or daily_command_reviews_missing
             or agent_memory_candidates_missing
             or checkin_answers_missing
+            or command_center_messages_missing
         )
 
 
@@ -663,6 +683,7 @@ def init_db():
         _create_daily_command_reviews_table(cursor)
         _create_agent_memory_candidates_table(cursor)
         _create_checkin_answers_table(cursor)
+        _create_command_center_messages_table(cursor)
         conn.commit()
 
     init_daily_reviews_table(create_backup=False)
@@ -674,6 +695,7 @@ def init_db():
     init_daily_command_reviews_table(create_backup=False)
     init_agent_memory_candidates_table(create_backup=False)
     init_checkin_answers_table(create_backup=False)
+    init_command_center_messages_table(create_backup=False)
     score_unscored_active_tasks()
 
 
@@ -850,6 +872,24 @@ def init_checkin_answers_table(create_backup=True):
     with closing(_connect()) as conn:
         cursor = conn.cursor()
         _create_checkin_answers_table(cursor)
+        conn.commit()
+
+
+def init_command_center_messages_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            missing = not _table_exists(cursor, "command_center_messages")
+
+    if missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_command_center_messages_table(cursor)
         conn.commit()
 
 
@@ -2018,6 +2058,86 @@ def get_checkin_answers_by_date(checkin_date):
             ORDER BY created_at DESC, id DESC
             ''',
             (checkin_date,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def create_command_center_message(
+    message_date,
+    role,
+    content,
+    proposal_json=None,
+    applied=0,
+):
+    role = _clean_review_text(role)
+    if role not in ("user", "assistant", "system"):
+        raise ValueError("Message role must be user, assistant, or system.")
+
+    content = _clean_review_text(content)
+    if not content:
+        raise ValueError("Message content is required.")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO command_center_messages (
+                message_date, role, content, proposal_json, applied,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                _clean_review_date(message_date),
+                role,
+                content,
+                _clean_review_text(proposal_json),
+                1 if applied else 0,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def mark_command_center_message_applied(message_id):
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE command_center_messages
+            SET applied = 1,
+                updated_at = ?
+            WHERE id = ?
+            ''',
+            (now, int(message_id)),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def get_recent_command_center_messages(message_date=None, limit=20):
+    limit = max(1, int(limit))
+    params = []
+    where_clause = ""
+    if message_date:
+        where_clause = "WHERE message_date = ?"
+        params.append(_clean_review_date(message_date))
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            SELECT id, message_date, role, content, proposal_json, applied,
+                   created_at, updated_at
+            FROM command_center_messages
+            {where_clause}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            ''',
+            (*params, limit),
         )
         return [dict(row) for row in cursor.fetchall()]
 
