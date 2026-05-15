@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import shutil
 import sqlite3
 from contextlib import closing
@@ -48,6 +49,7 @@ VALID_COMMITMENT_TYPES = (
     "personal",
     "other",
 )
+VALID_MEMORY_CANDIDATE_DECISIONS = ("pending", "accepted", "ignored", "duplicate")
 
 
 def _connect():
@@ -310,6 +312,73 @@ def _create_daily_commands_table(cursor):
     ''')
 
 
+def _create_daily_command_reviews_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_command_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            command_id INTEGER NOT NULL UNIQUE,
+            command_date TEXT NOT NULL,
+            review_date TEXT NOT NULL,
+            completion_score REAL DEFAULT 0,
+            planning_accuracy TEXT,
+            main_tasks_completed INTEGER DEFAULT 0,
+            main_tasks_total INTEGER DEFAULT 0,
+            focus_minutes INTEGER DEFAULT 0,
+            focus_sessions_count INTEGER DEFAULT 0,
+            avoidance_flags TEXT,
+            time_estimation_notes TEXT,
+            overload_warning TEXT,
+            feedback_summary TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
+def _create_agent_memory_candidates_table(cursor):
+    allowed_types = "', '".join(VALID_MEMORY_TYPES)
+    allowed_confidences = "', '".join(VALID_MEMORY_CONFIDENCES)
+    allowed_decisions = "', '".join(VALID_MEMORY_CANDIDATE_DECISIONS)
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS agent_memory_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_hash TEXT UNIQUE,
+            memory_type TEXT NOT NULL CHECK (
+                memory_type IN ('{allowed_types}')
+            ),
+            memory_key TEXT NOT NULL,
+            memory_value TEXT NOT NULL,
+            confidence TEXT CHECK (
+                confidence IS NULL
+                OR confidence IN ('{allowed_confidences}')
+            ),
+            source TEXT,
+            evidence_json TEXT,
+            decision_status TEXT DEFAULT 'pending' CHECK (
+                decision_status IN ('{allowed_decisions}')
+            ),
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
+def _create_checkin_answers_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS checkin_answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            checkin_date TEXT NOT NULL,
+            question TEXT NOT NULL,
+            answer TEXT,
+            reason TEXT,
+            answer_type TEXT,
+            source TEXT DEFAULT 'ai_question_coach',
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
 def _table_columns(cursor, table_name):
     cursor.execute(f"PRAGMA table_info({table_name})")
     return [row["name"] for row in cursor.fetchall()]
@@ -365,6 +434,15 @@ def _database_needs_backup_before_init():
             "personal_commitments",
         )
         daily_commands_missing = not _table_exists(cursor, "daily_commands")
+        daily_command_reviews_missing = not _table_exists(
+            cursor,
+            "daily_command_reviews",
+        )
+        agent_memory_candidates_missing = not _table_exists(
+            cursor,
+            "agent_memory_candidates",
+        )
+        checkin_answers_missing = not _table_exists(cursor, "checkin_answers")
         return (
             tasks_need_migration
             or daily_reviews_missing
@@ -375,6 +453,9 @@ def _database_needs_backup_before_init():
             or morning_checkins_missing
             or personal_commitments_missing
             or daily_commands_missing
+            or daily_command_reviews_missing
+            or agent_memory_candidates_missing
+            or checkin_answers_missing
         )
 
 
@@ -579,6 +660,9 @@ def init_db():
         _create_morning_checkins_table(cursor)
         _create_personal_commitments_table(cursor)
         _create_daily_commands_table(cursor)
+        _create_daily_command_reviews_table(cursor)
+        _create_agent_memory_candidates_table(cursor)
+        _create_checkin_answers_table(cursor)
         conn.commit()
 
     init_daily_reviews_table(create_backup=False)
@@ -587,6 +671,9 @@ def init_db():
     init_morning_checkins_table(create_backup=False)
     init_personal_commitments_table(create_backup=False)
     init_daily_commands_table(create_backup=False)
+    init_daily_command_reviews_table(create_backup=False)
+    init_agent_memory_candidates_table(create_backup=False)
+    init_checkin_answers_table(create_backup=False)
     score_unscored_active_tasks()
 
 
@@ -709,6 +796,60 @@ def init_daily_commands_table(create_backup=True):
     with closing(_connect()) as conn:
         cursor = conn.cursor()
         _create_daily_commands_table(cursor)
+        conn.commit()
+
+
+def init_daily_command_reviews_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            missing = not _table_exists(cursor, "daily_command_reviews")
+
+    if missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_daily_command_reviews_table(cursor)
+        conn.commit()
+
+
+def init_agent_memory_candidates_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            missing = not _table_exists(cursor, "agent_memory_candidates")
+
+    if missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_agent_memory_candidates_table(cursor)
+        conn.commit()
+
+
+def init_checkin_answers_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            missing = not _table_exists(cursor, "checkin_answers")
+
+    if missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_checkin_answers_table(cursor)
         conn.commit()
 
 
@@ -1547,6 +1688,336 @@ def get_recent_daily_commands(limit=7):
             LIMIT ?
             ''',
             (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def _normalize_daily_command_review(review):
+    command_id = int(review.get("command_id"))
+    if command_id <= 0:
+        raise ValueError("Command id is required.")
+
+    score = review.get("completion_score")
+    try:
+        score = float(score)
+    except (TypeError, ValueError):
+        score = 0.0
+    score = max(0.0, min(100.0, score))
+
+    return {
+        "command_id": command_id,
+        "command_date": _clean_review_date(review.get("command_date")),
+        "review_date": _clean_review_date(review.get("review_date")),
+        "completion_score": score,
+        "planning_accuracy": _clean_review_text(review.get("planning_accuracy")),
+        "main_tasks_completed": _clean_optional_int(
+            review.get("main_tasks_completed"),
+            minimum=0,
+        ) or 0,
+        "main_tasks_total": _clean_optional_int(
+            review.get("main_tasks_total"),
+            minimum=0,
+        ) or 0,
+        "focus_minutes": _clean_optional_int(review.get("focus_minutes"), minimum=0) or 0,
+        "focus_sessions_count": _clean_optional_int(
+            review.get("focus_sessions_count"),
+            minimum=0,
+        ) or 0,
+        "avoidance_flags": _clean_review_text(review.get("avoidance_flags")),
+        "time_estimation_notes": _clean_review_text(
+            review.get("time_estimation_notes")
+        ),
+        "overload_warning": _clean_review_text(review.get("overload_warning")),
+        "feedback_summary": _clean_review_text(review.get("feedback_summary")),
+    }
+
+
+def create_or_update_daily_command_review(review):
+    review = _normalize_daily_command_review(review)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO daily_command_reviews (
+                command_id, command_date, review_date, completion_score,
+                planning_accuracy, main_tasks_completed, main_tasks_total,
+                focus_minutes, focus_sessions_count, avoidance_flags,
+                time_estimation_notes, overload_warning, feedback_summary,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(command_id) DO UPDATE SET
+                command_date = excluded.command_date,
+                review_date = excluded.review_date,
+                completion_score = excluded.completion_score,
+                planning_accuracy = excluded.planning_accuracy,
+                main_tasks_completed = excluded.main_tasks_completed,
+                main_tasks_total = excluded.main_tasks_total,
+                focus_minutes = excluded.focus_minutes,
+                focus_sessions_count = excluded.focus_sessions_count,
+                avoidance_flags = excluded.avoidance_flags,
+                time_estimation_notes = excluded.time_estimation_notes,
+                overload_warning = excluded.overload_warning,
+                feedback_summary = excluded.feedback_summary,
+                updated_at = excluded.updated_at
+            ''',
+            (
+                review["command_id"],
+                review["command_date"],
+                review["review_date"],
+                review["completion_score"],
+                review["planning_accuracy"],
+                review["main_tasks_completed"],
+                review["main_tasks_total"],
+                review["focus_minutes"],
+                review["focus_sessions_count"],
+                review["avoidance_flags"],
+                review["time_estimation_notes"],
+                review["overload_warning"],
+                review["feedback_summary"],
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+    return get_daily_command_review_by_command(review["command_id"])
+
+
+def get_daily_command_review_by_command(command_id):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, command_id, command_date, review_date, completion_score,
+                   planning_accuracy, main_tasks_completed, main_tasks_total,
+                   focus_minutes, focus_sessions_count, avoidance_flags,
+                   time_estimation_notes, overload_warning, feedback_summary,
+                   created_at, updated_at
+            FROM daily_command_reviews
+            WHERE command_id = ?
+            LIMIT 1
+            ''',
+            (int(command_id),),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_recent_daily_command_reviews(limit=7):
+    limit = max(1, int(limit))
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, command_id, command_date, review_date, completion_score,
+                   planning_accuracy, main_tasks_completed, main_tasks_total,
+                   focus_minutes, focus_sessions_count, avoidance_flags,
+                   time_estimation_notes, overload_warning, feedback_summary,
+                   created_at, updated_at
+            FROM daily_command_reviews
+            ORDER BY review_date DESC, updated_at DESC, id DESC
+            LIMIT ?
+            ''',
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def _memory_candidate_hash(memory_type, memory_key, memory_value):
+    raw = "|".join([
+        _clean_memory_text(memory_type) or "",
+        _clean_memory_text(memory_key) or "",
+        _clean_memory_text(memory_value) or "",
+    ]).lower()
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _normalize_memory_candidate(candidate):
+    memory_type = _clean_memory_type(candidate.get("memory_type"))
+    memory_key = _clean_memory_text(candidate.get("memory_key"))
+    if not memory_key:
+        raise ValueError("Memory candidate key is required.")
+
+    memory_value = _clean_memory_text(candidate.get("memory_value"))
+    if not memory_value:
+        raise ValueError("Memory candidate value is required.")
+
+    decision_status = (
+        _clean_memory_text(candidate.get("decision_status")) or "pending"
+    )
+    if decision_status not in VALID_MEMORY_CANDIDATE_DECISIONS:
+        decision_status = "pending"
+
+    candidate_hash = _clean_memory_text(candidate.get("candidate_hash"))
+    if not candidate_hash:
+        candidate_hash = _memory_candidate_hash(
+            memory_type,
+            memory_key,
+            memory_value,
+        )
+
+    return {
+        "candidate_hash": candidate_hash,
+        "memory_type": memory_type,
+        "memory_key": memory_key,
+        "memory_value": memory_value,
+        "confidence": _clean_memory_confidence(candidate.get("confidence")) or "medium",
+        "source": _clean_memory_text(candidate.get("source")) or "feedback_loop",
+        "evidence_json": _clean_memory_text(candidate.get("evidence_json")),
+        "decision_status": decision_status,
+    }
+
+
+def create_agent_memory_candidate(candidate):
+    candidate = _normalize_memory_candidate(candidate)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT OR IGNORE INTO agent_memory_candidates (
+                candidate_hash, memory_type, memory_key, memory_value,
+                confidence, source, evidence_json, decision_status,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                candidate["candidate_hash"],
+                candidate["memory_type"],
+                candidate["memory_key"],
+                candidate["memory_value"],
+                candidate["confidence"],
+                candidate["source"],
+                candidate["evidence_json"],
+                candidate["decision_status"],
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return None
+        return cursor.lastrowid
+
+
+def _fetch_agent_memory_candidates(where_clause="", params=()):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            SELECT id, candidate_hash, memory_type, memory_key, memory_value,
+                   confidence, source, evidence_json, decision_status,
+                   created_at, updated_at
+            FROM agent_memory_candidates
+            {where_clause}
+            ''',
+            params,
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_pending_agent_memory_candidates():
+    return _fetch_agent_memory_candidates(
+        '''
+        WHERE decision_status = 'pending'
+        ORDER BY updated_at DESC, id DESC
+        '''
+    )
+
+
+def update_agent_memory_candidate_decision(candidate_id, decision_status):
+    if decision_status not in VALID_MEMORY_CANDIDATE_DECISIONS:
+        raise ValueError(
+            "Memory candidate decision must be one of: "
+            f"{', '.join(VALID_MEMORY_CANDIDATE_DECISIONS)}."
+        )
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE agent_memory_candidates
+            SET decision_status = ?, updated_at = ?
+            WHERE id = ?
+            ''',
+            (decision_status, now, int(candidate_id)),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def promote_memory_candidate_to_memory(candidate_id):
+    candidates = _fetch_agent_memory_candidates(
+        "WHERE id = ? LIMIT 1",
+        (int(candidate_id),),
+    )
+    if not candidates:
+        return None
+
+    candidate = candidates[0]
+    if memory_exists(candidate["memory_type"], candidate["memory_key"]):
+        update_agent_memory_candidate_decision(candidate_id, "duplicate")
+        return None
+
+    memory_id = create_agent_memory({
+        "memory_type": candidate["memory_type"],
+        "memory_key": candidate["memory_key"],
+        "memory_value": candidate["memory_value"],
+        "confidence": candidate["confidence"],
+        "source": candidate["source"],
+        "is_active": 1,
+    })
+    update_agent_memory_candidate_decision(candidate_id, "accepted")
+    return memory_id
+
+
+def create_checkin_answer(answer):
+    question = _clean_review_text(answer.get("question"))
+    if not question:
+        raise ValueError("Question is required.")
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO checkin_answers (
+                checkin_date, question, answer, reason, answer_type,
+                source, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                _clean_review_date(answer.get("checkin_date")),
+                question,
+                _clean_review_text(answer.get("answer")),
+                _clean_review_text(answer.get("reason")),
+                _clean_review_text(answer.get("answer_type")),
+                _clean_review_text(answer.get("source")) or "ai_question_coach",
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_checkin_answers_by_date(checkin_date):
+    checkin_date = _clean_review_date(checkin_date)
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, checkin_date, question, answer, reason, answer_type,
+                   source, created_at, updated_at
+            FROM checkin_answers
+            WHERE checkin_date = ?
+            ORDER BY created_at DESC, id DESC
+            ''',
+            (checkin_date,),
         )
         return [dict(row) for row in cursor.fetchall()]
 

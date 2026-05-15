@@ -1,7 +1,7 @@
 import hashlib
 import json
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import streamlit as st
@@ -27,10 +27,19 @@ from daily_command import (
     generate_daily_command,
     has_openai_api_key as has_daily_command_api_key,
 )
+from feedback_loop import evaluate_daily_command
+from question_coach import (
+    QuestionCoachConfigError,
+    QuestionCoachResponseError,
+    generate_checkin_questions,
+    has_openai_api_key as has_question_coach_api_key,
+)
 from db import (
     archive_course,
     complete_study_session,
     create_agent_memory,
+    create_agent_memory_candidate,
+    create_checkin_answer,
     create_or_update_morning_checkin,
     create_or_update_daily_review,
     create_personal_commitment,
@@ -42,15 +51,19 @@ from db import (
     get_active_study_session,
     get_active_agent_memory,
     get_all_tasks,
+    get_checkin_answers_by_date,
     get_daily_review_by_date,
+    get_daily_command_review_by_command,
     get_latest_daily_command,
     get_latest_ai_boss_briefing,
     get_course_summaries,
     get_morning_checkin_by_date,
+    get_pending_agent_memory_candidates,
     memory_exists,
     get_personal_commitments_for_date,
     get_task_candidates,
     get_recent_daily_commands,
+    get_recent_daily_command_reviews,
     get_recent_ai_boss_briefings,
     get_recent_study_sessions,
     get_recent_daily_reviews,
@@ -63,7 +76,10 @@ from db import (
     rescore_all_active_tasks,
     save_daily_command,
     save_ai_boss_briefing,
+    create_or_update_daily_command_review,
+    promote_memory_candidate_to_memory,
     unarchive_course,
+    update_agent_memory_candidate_decision,
     update_personal_commitment_status,
     update_task_candidate_decision,
     update_task_status,
@@ -79,6 +95,7 @@ EXPORT_DIR = BASE_DIR / "data" / "exports"
 
 MENU_OPTIONS = [
     "Daily Command",
+    "Feedback Loop",
     "Today Plan",
     "AI Boss",
     "Task Intake",
@@ -927,12 +944,108 @@ def render_personal_commitments(command_date):
                     st.rerun()
 
 
+def render_saved_checkin_answers(command_date):
+    answers = get_checkin_answers_by_date(command_date)
+    if not answers:
+        return
+
+    st.markdown("#### Saved Q&A")
+    for answer in answers[:5]:
+        with st.container(border=True):
+            st.markdown(f"**Q:** {display_value(answer['question'])}")
+            st.markdown(f"**A:** {display_value(answer['answer'])}")
+            if answer.get("reason"):
+                st.caption(answer["reason"])
+
+
+def render_question_coach(command_date, context):
+    st.markdown("### AI Question Coach")
+    st.caption(
+        "This uses a compact context and asks at most 3 follow-up questions. "
+        "It does not generate a plan or update tasks."
+    )
+
+    key_present = has_question_coach_api_key()
+    if not key_present:
+        st.warning("Add OPENAI_API_KEY to your .env file to use Question Coach.")
+
+    state_key = f"question_coach_questions_{command_date}"
+    existing_answers = get_checkin_answers_by_date(command_date)
+
+    if st.button("Ask Follow-Up Questions", disabled=not key_present):
+        with st.spinner("Finding the next useful questions..."):
+            try:
+                questions = generate_checkin_questions(
+                    context,
+                    existing_answers=existing_answers,
+                    max_questions=3,
+                )
+            except QuestionCoachConfigError as error:
+                st.error(str(error))
+                return
+            except QuestionCoachResponseError as error:
+                st.error(str(error))
+                if error.raw_response:
+                    st.text_area(
+                        "Raw AI response",
+                        value=error.raw_response,
+                        height=220,
+                    )
+                return
+            except Exception as error:
+                st.error(f"Could not generate follow-up questions: {error}")
+                return
+
+        st.session_state[state_key] = questions
+        if not questions:
+            st.info("Question Coach did not find any useful follow-up questions.")
+
+    questions = st.session_state.get(state_key) or []
+    if questions:
+        with st.form(f"question_coach_answer_form_{command_date}"):
+            answers = []
+            for index, question in enumerate(questions, start=1):
+                st.markdown(f"#### Question {index}")
+                st.markdown(display_value(question["question"]))
+                st.caption(display_value(question.get("reason")))
+                answer = st.text_area(
+                    "Answer",
+                    key=f"question-coach-answer-{command_date}-{index}",
+                )
+                answers.append((question, answer))
+            submitted = st.form_submit_button("Save Answers")
+
+        if submitted:
+            saved = 0
+            for question, answer in answers:
+                if not str(answer or "").strip():
+                    continue
+                create_checkin_answer({
+                    "checkin_date": command_date,
+                    "question": question["question"],
+                    "answer": answer,
+                    "reason": question.get("reason"),
+                    "answer_type": question.get("answer_type"),
+                    "source": "ai_question_coach",
+                })
+                saved += 1
+            if saved:
+                st.session_state.pop(state_key, None)
+                st.success(f"Saved {saved} answer(s).")
+                st.rerun()
+            else:
+                st.info("No answers were saved because all answer fields were empty.")
+
+    render_saved_checkin_answers(command_date)
+
+
 def current_daily_command_context(command_date):
     tasks = get_all_tasks()
     command_day = datetime.strptime(command_date, "%Y-%m-%d").date()
     today_plan = generate_today_plan(tasks, max_tasks=3, today=command_day)
     checkin = get_morning_checkin_by_date(command_date)
     commitments = get_personal_commitments_for_date(command_date)
+    checkin_answers = get_checkin_answers_by_date(command_date)
     recent_sessions = get_recent_study_sessions(limit=20)
     recent_reviews = get_recent_daily_reviews(limit=7)
     memories = get_active_agent_memory()
@@ -942,6 +1055,7 @@ def current_daily_command_context(command_date):
         today_plan=today_plan,
         morning_checkin=checkin,
         personal_commitments=commitments,
+        checkin_answers=checkin_answers,
         recent_study_sessions=recent_sessions,
         recent_daily_reviews=recent_reviews,
         active_memories=memories,
@@ -962,11 +1076,12 @@ def render_daily_command_status(context):
         st.warning("Save the Morning Check-In first so the plan has today's context.")
 
     counts = context["counts"]
-    columns = st.columns(4)
+    columns = st.columns(5)
     columns[0].metric("Active Tasks", counts["active_tasks"])
     columns[1].metric("Today Plan", counts["today_plan_items"])
     columns[2].metric("Commitments", counts["personal_commitments"])
-    columns[3].metric("Memories", counts["active_memories"])
+    columns[3].metric("Q&A Answers", counts.get("checkin_answers", 0))
+    columns[4].metric("Memories", counts["active_memories"])
 
 
 def parse_saved_daily_command(record):
@@ -1178,10 +1293,175 @@ def render_daily_command():
     context, tasks = current_daily_command_context(command_date)
     task_lookup = task_lookup_by_id(tasks)
 
+    render_question_coach(command_date, context)
     render_daily_command_status(context)
     render_daily_command_generate(context, task_lookup)
     render_latest_daily_command(command_date, task_lookup)
     render_recent_daily_commands()
+
+
+def parse_json_list(value):
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def render_feedback_review(review):
+    if not review:
+        st.info("No feedback review to display yet.")
+        return
+
+    st.markdown("### Feedback Review")
+    columns = st.columns(5)
+    columns[0].metric("Score", f"{review['completion_score']:.1f}")
+    columns[1].metric("Accuracy", display_value(review["planning_accuracy"]))
+    columns[2].metric(
+        "Main Tasks",
+        f"{review['main_tasks_completed']}/{review['main_tasks_total']}",
+    )
+    columns[3].metric("Focus Minutes", review["focus_minutes"])
+    columns[4].metric("Sessions", review["focus_sessions_count"])
+
+    st.markdown(f"**Summary**  \n{display_value(review['feedback_summary'])}")
+
+    avoidance_flags = parse_json_list(review.get("avoidance_flags"))
+    if avoidance_flags:
+        st.markdown("#### Avoidance Flags")
+        for flag in avoidance_flags:
+            st.markdown(f"- {display_value(flag)}")
+
+    if review.get("time_estimation_notes"):
+        st.markdown("#### Time Estimation Notes")
+        st.write(review["time_estimation_notes"])
+
+    if review.get("overload_warning"):
+        st.markdown("#### Overload Warning")
+        st.warning(review["overload_warning"])
+
+
+def render_feedback_evaluator():
+    st.markdown("### Evaluate Daily Command")
+    st.caption(
+        "This is rule-based. It compares a saved Daily Command with task status, "
+        "focus sessions, and Daily Review. It does not call AI."
+    )
+    selected_date = st.date_input(
+        "Command date to evaluate",
+        value=date.today() - timedelta(days=1),
+    )
+    command_date = selected_date.isoformat()
+    command_record = get_latest_daily_command(command_date)
+    if not command_record:
+        st.info("No Daily Command was saved for this date.")
+        return
+
+    existing_review = get_daily_command_review_by_command(command_record["id"])
+    if existing_review:
+        render_feedback_review(existing_review)
+
+    if st.button("Evaluate This Daily Command"):
+        daily_review = get_daily_review_by_date(command_date)
+        result = evaluate_daily_command(
+            command_record=command_record,
+            tasks=get_all_tasks(),
+            study_sessions=get_recent_study_sessions(limit=200),
+            daily_review=daily_review,
+            review_date=date.today().isoformat(),
+        )
+        saved_review = create_or_update_daily_command_review(result["review"])
+        created_candidates = 0
+        duplicate_candidates = 0
+        for candidate in result["memory_candidates"]:
+            if create_agent_memory_candidate(candidate):
+                created_candidates += 1
+            else:
+                duplicate_candidates += 1
+
+        st.success(
+            "Feedback review saved. "
+            f"Created {created_candidates} memory candidate(s), "
+            f"skipped {duplicate_candidates} duplicate candidate(s)."
+        )
+        render_feedback_review(saved_review)
+
+
+def render_memory_candidate_review():
+    st.markdown("### Memory Candidates")
+    candidates = get_pending_agent_memory_candidates()
+    if not candidates:
+        st.info("No pending memory candidates right now.")
+        return
+
+    for candidate in candidates:
+        with st.container(border=True):
+            st.markdown(
+                f"#### {display_value(candidate['memory_type'])}: "
+                f"{display_value(candidate['memory_key'])}"
+            )
+            st.markdown(display_value(candidate["memory_value"]))
+            columns = st.columns(3)
+            columns[0].markdown(
+                f"**Confidence**  \n{display_value(candidate['confidence'])}"
+            )
+            columns[1].markdown(f"**Source**  \n{display_value(candidate['source'])}")
+            columns[2].markdown(
+                f"**Created**  \n{display_datetime(candidate['created_at'])}"
+            )
+
+            if candidate.get("evidence_json"):
+                with st.expander("Evidence"):
+                    st.code(candidate["evidence_json"], language="json")
+
+            columns = st.columns(2)
+            with columns[0]:
+                if st.button(
+                    "Accept as Agent Memory",
+                    key=f"accept-memory-candidate-{candidate['id']}",
+                ):
+                    memory_id = promote_memory_candidate_to_memory(candidate["id"])
+                    if memory_id:
+                        st.success("Memory candidate accepted.")
+                    else:
+                        st.info("Memory already exists or candidate could not be promoted.")
+                    st.rerun()
+            with columns[1]:
+                if st.button(
+                    "Ignore Candidate",
+                    key=f"ignore-memory-candidate-{candidate['id']}",
+                ):
+                    update_agent_memory_candidate_decision(candidate["id"], "ignored")
+                    st.success("Memory candidate ignored.")
+                    st.rerun()
+
+
+def render_recent_feedback_reviews():
+    st.markdown("### Recent Feedback Reviews")
+    reviews = get_recent_daily_command_reviews(limit=7)
+    if not reviews:
+        st.info("No feedback reviews saved yet.")
+        return
+
+    for review in reviews:
+        with st.expander(
+            f"{review['command_date']} - score {review['completion_score']:.1f}"
+        ):
+            render_feedback_review(review)
+
+
+def render_feedback_loop():
+    st.subheader("Feedback Loop")
+    st.info(
+        "Feedback Loop compares the Daily Command against what actually happened. "
+        "It can suggest memory candidates, but you decide whether they become "
+        "active Agent Memory."
+    )
+    render_feedback_evaluator()
+    render_memory_candidate_review()
+    render_recent_feedback_reviews()
 
 
 def file_extraction_key(filename, extracted_text):
@@ -2164,6 +2444,8 @@ def main():
 
     if choice == "Daily Command":
         render_daily_command()
+    elif choice == "Feedback Loop":
+        render_feedback_loop()
     elif choice == "Today Plan":
         render_today_plan()
     elif choice == "AI Boss":

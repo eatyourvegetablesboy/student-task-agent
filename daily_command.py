@@ -227,6 +227,16 @@ def _compact_personal_commitment(commitment):
     }
 
 
+def _compact_checkin_answer(answer):
+    return {
+        "question": _truncate(answer.get("question"), 240),
+        "answer": _truncate(answer.get("answer"), 360),
+        "reason": _truncate(answer.get("reason"), 240),
+        "answer_type": answer.get("answer_type"),
+        "created_at": answer.get("created_at"),
+    }
+
+
 def _active_task_sort_key(task, current_date):
     score, _, _ = calculate_urgency_score(task, current_date)
     due_at = task.get("due_at") or "9999-12-31"
@@ -253,6 +263,7 @@ def build_daily_command_context(
     recent_daily_reviews,
     active_memories,
     current_date,
+    checkin_answers=None,
 ):
     """
     Build a compact local context for Daily Command.
@@ -261,6 +272,7 @@ def build_daily_command_context(
     private database dumps, or raw course descriptions.
     """
     current_day = _parse_context_date(current_date)
+    checkin_answers = checkin_answers or []
     active_tasks = [task for task in tasks if _is_active_task(task)]
     ranked_active_tasks = sorted(
         active_tasks,
@@ -289,6 +301,7 @@ def build_daily_command_context(
             "active_tasks": len(active_tasks),
             "today_plan_items": len(today_plan[:3]),
             "personal_commitments": len(personal_commitments),
+            "checkin_answers": len(checkin_answers),
             "recent_study_sessions": len(recent_sessions[:20]),
             "recent_daily_reviews": len(recent_daily_reviews[:7]),
             "active_memories": len(active_memories),
@@ -297,6 +310,9 @@ def build_daily_command_context(
         "personal_commitments": [
             _compact_personal_commitment(commitment)
             for commitment in personal_commitments
+        ],
+        "checkin_answers": [
+            _compact_checkin_answer(answer) for answer in checkin_answers[:10]
         ],
         "today_plan": [
             _compact_today_plan_item(item, current_day)
