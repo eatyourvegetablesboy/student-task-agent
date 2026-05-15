@@ -117,15 +117,14 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 EXPORT_DIR = BASE_DIR / "data" / "exports"
 
 MAIN_MENU_OPTIONS = [
-    "Command Center",
-    "Tasks",
+    "Today",
     "Focus",
-    "Memory",
-    "Settings",
+    "Review",
     "Advanced",
 ]
 
 ADVANCED_MENU_OPTIONS = [
+    "Tasks",
     "Today",
     "This Week",
     "Today Plan",
@@ -143,6 +142,8 @@ ADVANCED_MENU_OPTIONS = [
     "Completed",
     "Files / Syllabus Upload",
     "Quercus Sync",
+    "Settings",
+    "Memory",
     "Add Task",
     "All Tasks",
 ]
@@ -1793,12 +1794,23 @@ def render_minimum_viable_day(behavior_plan):
             st.caption(f"Success: {definition}")
 
 
+def planning_cap_from_tasks(top_tasks):
+    labels = [task_urgency(task)[1] for task in top_tasks]
+    if "critical" in labels:
+        return 5, "critical"
+    if "urgent" in labels:
+        return 10, "urgent"
+    return 15, "normal"
+
+
 def render_command_hero(command, behavior_plan, top_tasks, active_session):
     behavior_task = behavior_first_task(behavior_plan)
     objective = None
     first_action = None
+    planning_cap, urgency_mode = planning_cap_from_tasks(top_tasks)
     if behavior_plan:
         objective = behavior_plan.get("main_objective")
+        planning_cap = behavior_plan.get("planning_cap_minutes") or planning_cap
     if command and not objective:
         objective = command.get("executive_summary")
     if behavior_task:
@@ -1812,17 +1824,33 @@ def render_command_hero(command, behavior_plan, top_tasks, active_session):
     if not first_action:
         first_action = "Add or sync tasks, then start with one 25-minute block."
 
+    if urgency_mode in ("critical", "urgent"):
+        meta_text = (
+            f"Planning is capped at {planning_cap} minutes. "
+            "Do not keep organizing. Start the first action."
+        )
+        button_label = "Stop Planning. Start 25 Minutes."
+    else:
+        meta_text = (
+            f"Planning is capped at {planning_cap} minutes. "
+            "Start the first behavior when ready."
+        )
+        button_label = "Start First 25-Minute Focus"
+
     st.markdown(
         (
             '<div class="calm-hero">'
             "<div class=\"calm-eyebrow\">Today's Command</div>"
             f'<div class="calm-objective">{escape_html(objective)}</div>'
             f'<div class="calm-first-action">{escape_html(first_action)}</div>'
-            '<div class="calm-meta">Planning should stay short. Start the first behavior when ready.</div>'
+            f'<div class="calm-meta">{escape_html(meta_text)}</div>'
             '</div>'
         ),
         unsafe_allow_html=True,
     )
+
+    if urgency_mode in ("critical", "urgent"):
+        st.warning(meta_text)
 
     if active_session:
         st.warning(
@@ -1834,7 +1862,7 @@ def render_command_hero(command, behavior_plan, top_tasks, active_session):
 
     if top_tasks:
         if st.button(
-            "Start First 25-Minute Focus",
+            button_label,
             key=f"command-center-primary-focus-{top_tasks[0]['id']}",
             type="primary",
         ):
@@ -1885,17 +1913,6 @@ def render_command_center_top_tasks(tasks):
             )
             if not active_session and index == 1:
                 st.caption("Primary action is the button above.")
-            elif not active_session and st.button(
-                "Start Focus",
-                key=f"command-center-start-focus-{task['id']}",
-            ):
-                try:
-                    start_focus_session_for_task(task)
-                except ValueError as error:
-                    st.error(str(error))
-                else:
-                    st.success("Focus session started.")
-                    st.rerun()
             with st.expander("Details"):
                 st.caption(f"Urgency score: {urgency_score:.1f}")
                 render_task_fields(task)
@@ -2056,7 +2073,7 @@ def render_command_center_quick_command(context, task_lookup):
 
 
 def render_command_center():
-    st.markdown("## Command Center")
+    st.markdown("## Today")
     command_date = date.today().isoformat()
     context, tasks = current_daily_command_context(command_date)
 
@@ -2065,7 +2082,7 @@ def render_command_center():
 
     refreshed_context, refreshed_tasks = current_daily_command_context(command_date)
     refreshed_lookup = task_lookup_by_id(refreshed_tasks)
-    with st.expander("Daily Command", expanded=False):
+    with st.expander("Generate / Adjust Plan", expanded=False):
         render_command_center_quick_command(refreshed_context, refreshed_lookup)
         render_latest_daily_command(command_date, refreshed_lookup)
 
@@ -3840,6 +3857,12 @@ def render_advanced_workspace():
 def render_advanced_choice(choice):
     if choice == "Command Center":
         render_command_center()
+    elif choice == "Tasks":
+        render_tasks_workspace()
+    elif choice == "Settings":
+        render_settings_workspace()
+    elif choice == "Memory":
+        render_memory_workspace()
     elif choice == "Daily Command":
         render_daily_command()
     elif choice == "Behavior Design":
@@ -3882,16 +3905,12 @@ def main():
 
     choice = st.sidebar.radio("Menu", MAIN_MENU_OPTIONS, label_visibility="collapsed")
 
-    if choice == "Command Center":
+    if choice == "Today":
         render_command_center()
-    elif choice == "Tasks":
-        render_tasks_workspace()
     elif choice == "Focus":
         render_focus_session()
-    elif choice == "Memory":
-        render_memory_workspace()
-    elif choice == "Settings":
-        render_settings_workspace()
+    elif choice == "Review":
+        render_daily_review()
     else:
         render_advanced_workspace()
 
