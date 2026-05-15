@@ -103,18 +103,26 @@ BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 EXPORT_DIR = BASE_DIR / "data" / "exports"
 
-MENU_OPTIONS = [
+MAIN_MENU_OPTIONS = [
     "Command Center",
+    "Tasks",
+    "Focus",
+    "Memory",
+    "Settings",
+    "Advanced",
+]
+
+ADVANCED_MENU_OPTIONS = [
+    "Today",
+    "This Week",
+    "Today Plan",
     "Daily Command",
     "Feedback Loop",
-    "Today Plan",
     "AI Boss",
     "Task Intake",
     "Focus Session",
     "Daily Review",
     "Agent Memory",
-    "Today",
-    "This Week",
     "Confirmed Tasks",
     "Suggested Tasks",
     "In Progress",
@@ -1079,18 +1087,20 @@ def render_conversation_proposal(proposal):
 
 
 def render_command_center_top_tasks(tasks):
-    st.markdown("### Now")
+    st.markdown("### Today")
     latest = get_latest_daily_command(date.today().isoformat())
     if latest:
         command = parse_saved_daily_command(latest)
         if command:
-            st.markdown(f"**Daily Command:** {display_value(command.get('executive_summary'))}")
-            st.caption(
-                "First 25 minutes: "
-                f"{display_value(command.get('first_25_minute_action'))}"
-            )
+            with st.chat_message("assistant"):
+                st.write(display_value(command.get("executive_summary")))
+                st.caption(
+                    "First 25 minutes: "
+                    f"{display_value(command.get('first_25_minute_action'))}"
+                )
     else:
-        st.info("No Daily Command saved for today yet.")
+        with st.chat_message("assistant"):
+            st.write("No Daily Command yet. Tell me your constraints and I can help shape one.")
 
     active_session = get_active_study_session()
     if active_session:
@@ -1131,28 +1141,54 @@ def render_command_center_top_tasks(tasks):
 
 
 def render_command_center_conversation(command_date, context):
-    st.markdown("### Conversation Intake")
-    st.caption(
-        "Tell the AI what is happening. It will create a proposal first; you "
-        "choose whether to apply it."
-    )
-
     key_present = has_conversation_intake_api_key()
     if not key_present:
         st.warning("Add OPENAI_API_KEY to your .env file to use conversation intake.")
 
-    with st.form("command_center_message_form"):
-        message = st.text_area(
-            "Message",
-            placeholder=(
-                "Example: I slept 5 hours, feel tired, have class at 2, "
-                "gym at 6, and can study 2 hours. I finished the CLA reading."
-            ),
-            height=140,
-        )
-        submitted = st.form_submit_button("Analyze Message", disabled=not key_present)
+    render_command_center_chat_history(command_date)
 
-    if submitted:
+    proposal = st.session_state.get("command_center_proposal")
+    if proposal:
+        with st.chat_message("assistant"):
+            st.markdown("I prepared actions from your message. Review them before anything changes.")
+            render_conversation_proposal(proposal)
+            actions, selected_action_ids = render_confirmable_actions(
+                command_date,
+                proposal,
+            )
+            if selected_action_ids is not None:
+                if not selected_action_ids:
+                    st.info("No actions were selected.")
+                else:
+                    try:
+                        result = apply_selected_actions(actions, selected_action_ids)
+                    except ValueError as error:
+                        st.error(str(error))
+                        return
+                    message_id = st.session_state.get("command_center_message_id")
+                    if message_id and result["applied"] > 0:
+                        mark_command_center_message_applied(message_id)
+                    st.success(
+                        "Action engine finished. "
+                        f"Applied {result['applied']}, "
+                        f"skipped {result['skipped']}, "
+                        f"duplicates {result['duplicates']}."
+                    )
+                    st.session_state.pop("command_center_proposal", None)
+                    st.session_state.pop("command_center_message_id", None)
+                    st.rerun()
+            if st.button("Discard Proposal"):
+                st.session_state.pop("command_center_proposal", None)
+                st.session_state.pop("command_center_message_id", None)
+                st.rerun()
+
+    message = st.chat_input(
+        "Tell me what changed today...",
+        disabled=not key_present,
+    )
+    if message:
+        with st.chat_message("user"):
+            st.write(message)
         recent_messages = get_recent_command_center_messages(command_date, limit=5)
         with st.spinner("Parsing message into a proposal..."):
             try:
@@ -1190,58 +1226,31 @@ def render_command_center_conversation(command_date, context):
         )
         st.session_state.command_center_proposal = proposal_for_save
         st.session_state.command_center_message_id = message_id
-        st.success("Proposal ready. Review it before applying.")
-
-    proposal = st.session_state.get("command_center_proposal")
-    if proposal:
-        render_conversation_proposal(proposal)
-        actions, selected_action_ids = render_confirmable_actions(
-            command_date,
-            proposal,
-        )
-        if selected_action_ids is not None:
-            if not selected_action_ids:
-                st.info("No actions were selected.")
-            else:
-                try:
-                    result = apply_selected_actions(actions, selected_action_ids)
-                except ValueError as error:
-                    st.error(str(error))
-                    return
-                message_id = st.session_state.get("command_center_message_id")
-                if message_id and result["applied"] > 0:
-                    mark_command_center_message_applied(message_id)
-                st.success(
-                    "Action engine finished. "
-                    f"Applied {result['applied']}, "
-                    f"skipped {result['skipped']}, "
-                    f"duplicates {result['duplicates']}."
-                )
-                st.session_state.pop("command_center_proposal", None)
-                st.session_state.pop("command_center_message_id", None)
-                st.rerun()
-        if st.button("Discard Proposal"):
-            st.session_state.pop("command_center_proposal", None)
-            st.session_state.pop("command_center_message_id", None)
-            st.rerun()
+        st.rerun()
 
 
-def render_command_center_history(command_date):
-    messages = get_recent_command_center_messages(command_date, limit=8)
+def render_command_center_chat_history(command_date):
+    messages = list(reversed(get_recent_command_center_messages(command_date, limit=8)))
     if not messages:
+        with st.chat_message("assistant"):
+            st.write(
+                "Tell me today's constraints, completed work, blockers, or what "
+                "you want changed. I will propose actions first; you confirm."
+            )
         return
 
-    st.markdown("### Recent Conversation")
     for message in messages:
-        with st.expander(
-            f"{display_datetime(message['created_at'])} - "
-            f"{display_value(message['role'])}"
-        ):
+        role = "user" if message["role"] == "user" else "assistant"
+        with st.chat_message(role):
             st.write(message["content"])
             if message.get("proposal_json"):
-                st.caption("Proposal saved with this message.")
-            if message.get("applied"):
-                st.success("Applied")
+                try:
+                    proposal = json.loads(message["proposal_json"])
+                except json.JSONDecodeError:
+                    proposal = None
+                if proposal:
+                    status = "Applied" if message.get("applied") else "Not applied"
+                    st.caption(f"Proposal: {display_value(proposal.get('summary'))} ({status})")
 
 
 def render_command_center_quick_command(context, task_lookup):
@@ -1251,23 +1260,18 @@ def render_command_center_quick_command(context, task_lookup):
 
 
 def render_command_center():
-    st.subheader("Command Center")
-    st.info(
-        "This is the main daily入口: talk naturally, review the AI proposal, "
-        "then apply only what you approve."
-    )
+    st.markdown("## Command Center")
     command_date = date.today().isoformat()
     context, tasks = current_daily_command_context(command_date)
-    task_lookup = task_lookup_by_id(tasks)
 
     render_command_center_top_tasks(tasks)
     render_command_center_conversation(command_date, context)
 
     refreshed_context, refreshed_tasks = current_daily_command_context(command_date)
     refreshed_lookup = task_lookup_by_id(refreshed_tasks)
-    render_command_center_quick_command(refreshed_context, refreshed_lookup)
-    render_latest_daily_command(command_date, refreshed_lookup)
-    render_command_center_history(command_date)
+    with st.expander("Daily Command", expanded=False):
+        render_command_center_quick_command(refreshed_context, refreshed_lookup)
+        render_latest_daily_command(command_date, refreshed_lookup)
 
 
 def checkin_text_value(checkin, key):
@@ -2967,14 +2971,54 @@ def render_agent_memory():
     render_seed_agent_memory()
 
 
-def main():
-    st.title("Student Task Manager")
+def render_tasks_workspace():
+    st.subheader("Tasks")
+    task_view = st.radio(
+        "Task view",
+        options=["Today", "This Week", "Confirmed Tasks", "Suggested Tasks", "All Tasks"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    render_dashboard_view(task_view)
 
-    init_db()
-    show_pending_message()
 
-    choice = st.sidebar.selectbox("Menu", MENU_OPTIONS)
+def render_memory_workspace():
+    st.subheader("Memory")
+    memory_view = st.radio(
+        "Memory view",
+        options=["Agent Memory", "Feedback Loop", "Daily Review"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    if memory_view == "Agent Memory":
+        render_agent_memory()
+    elif memory_view == "Feedback Loop":
+        render_feedback_loop()
+    else:
+        render_daily_review()
 
+
+def render_settings_workspace():
+    st.subheader("Settings")
+    st.markdown("### Connections")
+    columns = st.columns(3)
+    columns[0].metric("OpenAI Key", "Yes" if has_openai_api_key() else "No")
+    columns[1].metric("Canvas URL", "Yes" if has_canvas_base_url() else "No")
+    columns[2].metric("Canvas Token", "Yes" if has_canvas_api_token() else "No")
+
+    with st.expander("Files / Syllabus Upload"):
+        render_file_upload()
+    with st.expander("Quercus Sync"):
+        render_quercus_sync()
+
+
+def render_advanced_workspace():
+    st.subheader("Advanced")
+    choice = st.selectbox("Advanced page", ADVANCED_MENU_OPTIONS)
+    render_advanced_choice(choice)
+
+
+def render_advanced_choice(choice):
     if choice == "Command Center":
         render_command_center()
     elif choice == "Daily Command":
@@ -3001,6 +3045,28 @@ def main():
         render_add_task_form()
     else:
         render_dashboard_view(choice)
+
+
+def main():
+    st.title("Student Task Manager")
+
+    init_db()
+    show_pending_message()
+
+    choice = st.sidebar.radio("Menu", MAIN_MENU_OPTIONS, label_visibility="collapsed")
+
+    if choice == "Command Center":
+        render_command_center()
+    elif choice == "Tasks":
+        render_tasks_workspace()
+    elif choice == "Focus":
+        render_focus_session()
+    elif choice == "Memory":
+        render_memory_workspace()
+    elif choice == "Settings":
+        render_settings_workspace()
+    else:
+        render_advanced_workspace()
 
 
 if __name__ == "__main__":
