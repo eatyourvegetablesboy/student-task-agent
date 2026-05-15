@@ -1,4 +1,5 @@
 import hashlib
+import html
 import json
 import re
 from datetime import date, datetime, timedelta
@@ -263,10 +264,237 @@ DEFAULT_AGENT_MEMORIES = [
 ]
 
 
+def inject_calm_command_css():
+    st.markdown(
+        """
+        <style>
+        :root {
+            --app-bg: #F7F7F2;
+            --card-bg: #FFFFFF;
+            --text-main: #1F2933;
+            --text-secondary: #374151;
+            --text-muted: #6B7280;
+            --border: #E5E7EB;
+            --primary: #2563EB;
+            --secondary: #0F766E;
+            --warning: #B45309;
+            --critical: #B91C1C;
+            --success: #15803D;
+        }
+
+        .stApp {
+            background: var(--app-bg);
+            color: var(--text-main);
+            font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        [data-testid="stHeader"] {
+            background: rgba(247, 247, 242, 0.92);
+            backdrop-filter: blur(8px);
+        }
+
+        [data-testid="stAppViewContainer"] .main .block-container {
+            max-width: 900px;
+            padding-top: 2.25rem;
+            padding-bottom: 3rem;
+        }
+
+        section[data-testid="stSidebar"] {
+            background: #FFFFFF;
+            border-right: 1px solid var(--border);
+        }
+
+        h1, h2, h3, h4 {
+            color: var(--text-main);
+            letter-spacing: 0;
+        }
+
+        p, li, label, [data-testid="stMarkdownContainer"] {
+            color: var(--text-secondary);
+            line-height: 1.55;
+        }
+
+        [data-testid="stCaptionContainer"],
+        small {
+            color: var(--text-muted);
+        }
+
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            box-shadow: 0 1px 2px rgba(31, 41, 51, 0.04);
+        }
+
+        .stButton > button {
+            border-radius: 8px;
+            min-height: 42px;
+            font-weight: 650;
+            border-color: var(--border);
+        }
+
+        .stButton > button[kind="primary"] {
+            background: var(--primary);
+            border-color: var(--primary);
+            color: #FFFFFF;
+        }
+
+        .stTextInput input,
+        .stTextArea textarea,
+        [data-baseweb="select"] {
+            border-radius: 8px;
+        }
+
+        div[data-testid="stMetric"] {
+            background: #FFFFFF;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0.75rem 0.9rem;
+        }
+
+        .calm-hero {
+            background: #FFFFFF;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.35rem 1.5rem;
+            margin: 0.75rem 0 1rem;
+        }
+
+        .calm-eyebrow {
+            color: var(--text-muted);
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            margin-bottom: 0.45rem;
+        }
+
+        .calm-objective {
+            color: var(--text-main);
+            font-size: 1.32rem;
+            font-weight: 760;
+            line-height: 1.35;
+            margin-bottom: 0.75rem;
+        }
+
+        .calm-first-action {
+            border-left: 3px solid var(--primary);
+            padding-left: 0.85rem;
+            color: var(--text-secondary);
+            font-size: 0.98rem;
+            line-height: 1.55;
+        }
+
+        .calm-meta {
+            color: var(--text-muted);
+            font-size: 0.84rem;
+            margin-top: 0.55rem;
+        }
+
+        .calm-badge {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 0.18rem 0.55rem;
+            font-size: 0.74rem;
+            font-weight: 700;
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            background: #F9FAFB;
+        }
+
+        .calm-badge-critical,
+        .calm-badge-urgent {
+            color: var(--critical);
+            border-color: rgba(185, 28, 28, 0.2);
+            background: rgba(185, 28, 28, 0.07);
+        }
+
+        .calm-badge-soon,
+        .calm-badge-normal {
+            color: var(--warning);
+            border-color: rgba(180, 83, 9, 0.2);
+            background: rgba(180, 83, 9, 0.07);
+        }
+
+        .calm-badge-low,
+        .calm-badge-no_due_date {
+            color: var(--text-muted);
+            background: #F3F4F6;
+        }
+
+        .task-title-row {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 0.75rem;
+            margin-bottom: 0.25rem;
+        }
+
+        .task-title-row h4 {
+            margin: 0;
+            font-size: 1rem;
+            line-height: 1.35;
+        }
+
+        .task-card-meta {
+            color: var(--text-muted);
+            font-size: 0.86rem;
+            margin: 0.25rem 0 0.75rem;
+        }
+
+        .focus-timer {
+            color: var(--text-main);
+            font-size: 2.25rem;
+            font-weight: 780;
+            line-height: 1.1;
+            margin: 0.2rem 0 1rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def display_value(value):
     if value is None or value == "":
         return "-"
     return str(value)
+
+
+def escape_html(value):
+    return html.escape(display_value(value), quote=True)
+
+
+def task_meta_line(task):
+    pieces = []
+    if task.get("course"):
+        pieces.append(task["course"])
+    if task.get("due_at"):
+        pieces.append(f"Due {task['due_at']}")
+    elif task.get("planned_date"):
+        pieces.append(f"Planned {task['planned_date']}")
+    if task.get("estimated_minutes"):
+        pieces.append(f"{task['estimated_minutes']} min")
+    if task.get("status"):
+        pieces.append(task["status"])
+    return " | ".join(str(piece) for piece in pieces) or "No metadata yet"
+
+
+def urgency_badge_html(label):
+    label = str(label or "normal")
+    badge_class = re.sub(r"[^a-z0-9_]+", "_", label.lower())
+    return (
+        f'<span class="calm-badge calm-badge-{badge_class}">'
+        f'{html.escape(label)}</span>'
+    )
+
+
+def first_action_for_task(task):
+    if task.get("first_action"):
+        return task["first_action"]
+    if task.get("next_action"):
+        return task["next_action"]
+    return "Open this task and write the exact next step."
 
 
 def display_date(task):
@@ -471,7 +699,7 @@ def start_focus_session_for_task(task, planned_minutes=25):
     return session_id
 
 
-def render_focus_action(task, current_view):
+def render_focus_action(task, current_view, button_type="secondary"):
     if not can_focus_task(task):
         return
 
@@ -483,6 +711,7 @@ def render_focus_action(task, current_view):
     if st.button(
         "Start Focus",
         key=f"{view_key(current_view)}-{task['id']}-start-focus",
+        type=button_type,
     ):
         try:
             start_focus_session_for_task(task)
@@ -501,14 +730,27 @@ def render_task_cards(tasks, current_view):
         return
 
     for task in tasks:
+        urgency_score, urgency_label = task_urgency(task)
         with st.container(border=True):
-            st.markdown(f"### {display_value(task['title'])}")
-            indicators = task_indicators(task)
-            if indicators:
-                st.caption(" | ".join(f"[{indicator}]" for indicator in indicators))
-            render_task_fields(task)
-            render_status_actions(task, current_view)
+            st.markdown(
+                (
+                    '<div class="task-title-row">'
+                    f'<h4>{escape_html(task["title"])}</h4>'
+                    f'{urgency_badge_html(urgency_label)}'
+                    '</div>'
+                    f'<div class="task-card-meta">{escape_html(task_meta_line(task))}</div>'
+                    f'<div class="calm-first-action">{escape_html(first_action_for_task(task))}</div>'
+                ),
+                unsafe_allow_html=True,
+            )
             render_focus_action(task, current_view)
+            with st.expander("Details"):
+                indicators = task_indicators(task)
+                if indicators:
+                    st.caption(" | ".join(f"[{indicator}]" for indicator in indicators))
+                st.caption(f"Urgency score: {urgency_score:.1f}")
+                render_task_fields(task)
+                render_status_actions(task, current_view)
 
 
 def render_add_task_form():
@@ -1519,32 +1761,110 @@ def render_conversation_proposal(proposal):
             st.markdown(f"- {display_value(question)}")
 
 
-def render_command_center_top_tasks(tasks):
-    st.markdown("### Today")
-    latest = get_latest_daily_command(date.today().isoformat())
-    if latest:
-        command = parse_saved_daily_command(latest)
-        if command:
-            with st.chat_message("assistant"):
-                st.write(display_value(command.get("executive_summary")))
-                st.caption(
-                    "First 25 minutes: "
-                    f"{display_value(command.get('first_25_minute_action'))}"
-                )
-    else:
-        with st.chat_message("assistant"):
-            st.write("No Daily Command yet. Tell me your constraints and I can help shape one.")
+def command_center_plan_snapshot(command_date):
+    latest = get_latest_daily_command(command_date)
+    command = parse_saved_daily_command(latest) if latest else None
+    behavior_record = get_behavior_plan_by_date(command_date)
+    behavior_plan = parse_saved_behavior_plan(behavior_record)
+    return command, behavior_plan
 
-    active_session = get_active_study_session()
+
+def behavior_first_task(behavior_plan):
+    if not behavior_plan:
+        return None
+    tasks = behavior_plan.get("top_tasks") or []
+    return tasks[0] if tasks else None
+
+
+def render_minimum_viable_day(behavior_plan):
+    if not behavior_plan:
+        return
+
+    minimum_day = behavior_plan.get("minimum_viable_day") or {}
+    required = minimum_day.get("required") or []
+    definition = minimum_day.get("definition_of_success")
+    if not required and not definition:
+        return
+
+    with st.expander("Minimum Viable Day", expanded=False):
+        for item in required[:4]:
+            st.markdown(f"- {display_value(item)}")
+        if definition:
+            st.caption(f"Success: {definition}")
+
+
+def render_command_hero(command, behavior_plan, top_tasks, active_session):
+    behavior_task = behavior_first_task(behavior_plan)
+    objective = None
+    first_action = None
+    if behavior_plan:
+        objective = behavior_plan.get("main_objective")
+    if command and not objective:
+        objective = command.get("executive_summary")
+    if behavior_task:
+        first_action = behavior_task.get("first_action_under_5_min")
+    if command and not first_action:
+        first_action = command.get("first_25_minute_action")
+    if not objective:
+        objective = "Tell me today's constraints, then generate a Daily Command."
+    if not first_action and top_tasks:
+        first_action = first_action_for_task(top_tasks[0])
+    if not first_action:
+        first_action = "Add or sync tasks, then start with one 25-minute block."
+
+    st.markdown(
+        (
+            '<div class="calm-hero">'
+            "<div class=\"calm-eyebrow\">Today's Command</div>"
+            f'<div class="calm-objective">{escape_html(objective)}</div>'
+            f'<div class="calm-first-action">{escape_html(first_action)}</div>'
+            '<div class="calm-meta">Planning should stay short. Start the first behavior when ready.</div>'
+            '</div>'
+        ),
+        unsafe_allow_html=True,
+    )
+
     if active_session:
         st.warning(
             "Active focus session: "
             f"{active_session['task_title']} "
             f"({elapsed_minutes_since(active_session['start_time'])} min elapsed)."
         )
+        return
 
-    st.markdown("### Top Tasks")
+    if top_tasks:
+        if st.button(
+            "Start First 25-Minute Focus",
+            key=f"command-center-primary-focus-{top_tasks[0]['id']}",
+            type="primary",
+        ):
+            try:
+                start_focus_session_for_task(top_tasks[0])
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                st.success("Focus session started.")
+                st.rerun()
+
+
+def render_command_center_top_tasks(tasks):
+    command_date = date.today().isoformat()
+    command, behavior_plan = command_center_plan_snapshot(command_date)
     top_tasks = top_urgent_tasks(limit=3)
+    active_session = get_active_study_session()
+
+    render_command_hero(command, behavior_plan, top_tasks, active_session)
+    render_minimum_viable_day(behavior_plan)
+
+    avoidance_warning = None
+    if behavior_plan:
+        avoidance_warning = behavior_plan.get("avoidance_warning")
+    if not avoidance_warning and command:
+        avoidance_warning = command.get("risk_warning")
+    if avoidance_warning:
+        st.warning(avoidance_warning)
+
+    st.markdown("### Top 3 Tasks")
     if not top_tasks:
         st.info("No active tasks right now.")
         return
@@ -1552,15 +1872,20 @@ def render_command_center_top_tasks(tasks):
     for index, task in enumerate(top_tasks, start=1):
         urgency_score, urgency_label = task_urgency(task)
         with st.container(border=True):
-            st.markdown(f"#### {index}. {display_value(task['title'])}")
-            columns = st.columns(4)
-            columns[0].markdown(f"**Course**  \n{display_value(task['course'])}")
-            columns[1].markdown(f"**Due**  \n{display_value(task['due_at'])}")
-            columns[2].markdown(f"**Status**  \n{display_value(task['status'])}")
-            columns[3].markdown(
-                f"**Urgency**  \n{display_value(urgency_label)} ({urgency_score:.1f})"
+            st.markdown(
+                (
+                    '<div class="task-title-row">'
+                    f'<h4>{index}. {escape_html(task["title"])}</h4>'
+                    f'{urgency_badge_html(urgency_label)}'
+                    '</div>'
+                    f'<div class="task-card-meta">{escape_html(task_meta_line(task))}</div>'
+                    f'<div class="calm-first-action">{escape_html(first_action_for_task(task))}</div>'
+                ),
+                unsafe_allow_html=True,
             )
-            if not active_session and st.button(
+            if not active_session and index == 1:
+                st.caption("Primary action is the button above.")
+            elif not active_session and st.button(
                 "Start Focus",
                 key=f"command-center-start-focus-{task['id']}",
             ):
@@ -1571,7 +1896,22 @@ def render_command_center_top_tasks(tasks):
                 else:
                     st.success("Focus session started.")
                     st.rerun()
+            with st.expander("Details"):
+                st.caption(f"Urgency score: {urgency_score:.1f}")
+                render_task_fields(task)
 
+    with st.expander("Daily Command and First Action Tools", expanded=False):
+        if command:
+            st.write(display_value(command.get("executive_summary")))
+            st.caption(
+                "First 25 minutes: "
+                f"{display_value(command.get('first_25_minute_action'))}"
+            )
+        else:
+            st.write(
+                "No Daily Command yet. Tell me your constraints below, or use "
+                "the tools here to generate one."
+            )
 
 def render_command_center_conversation(command_date, context):
     key_present = has_conversation_intake_api_key()
@@ -3014,12 +3354,34 @@ def active_tasks():
     ]
 
 
+def get_task_by_id(task_id):
+    if task_id in (None, ""):
+        return None
+    task_id = int(task_id)
+    for task in get_all_tasks():
+        if int(task.get("id") or 0) == task_id:
+            return task
+    return None
+
+
 def render_session_summary(session):
-    st.markdown(f"**Task:** {display_value(session['task_title'])}")
-    st.markdown(f"**Course:** {display_value(session['course'])}")
-    st.markdown(f"**Started:** {display_datetime(session['start_time'])}")
-    st.markdown(f"**Planned:** {display_value(session['planned_minutes'])} min")
-    st.markdown(f"**Elapsed:** about {elapsed_minutes_since(session['start_time'])} min")
+    task = get_task_by_id(session.get("task_id"))
+    first_action = first_action_for_task(task) if task else "Stay with the current task."
+    elapsed = elapsed_minutes_since(session["start_time"])
+    st.markdown(
+        (
+            '<div class="calm-hero">'
+            '<div class="calm-eyebrow">Focus Session</div>'
+            f'<div class="calm-objective">{escape_html(session["task_title"])}</div>'
+            f'<div class="focus-timer">{elapsed} min</div>'
+            f'<div class="calm-first-action">{escape_html(first_action)}</div>'
+            f'<div class="calm-meta">Course: {escape_html(session.get("course"))} | '
+            f'Started {escape_html(display_datetime(session.get("start_time")))} | '
+            f'Planned {escape_html(session.get("planned_minutes"))} min</div>'
+            '</div>'
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def render_start_focus_session():
@@ -3041,7 +3403,7 @@ def render_start_focus_session():
         step=5,
     )
 
-    if st.button("Start Focus Session"):
+    if st.button("Start Focus Session", type="primary"):
         task = task_lookup[selected_task_id]
         try:
             start_focus_session_for_task(task, planned_minutes)
@@ -3130,13 +3492,13 @@ def render_focus_session():
     active_session = get_active_study_session()
 
     if active_session:
-        st.markdown("### Active Session")
         render_end_focus_session(active_session)
     else:
         st.markdown("### Start Session")
         render_start_focus_session()
 
-    render_recent_study_sessions()
+    with st.expander("Recent Sessions", expanded=False):
+        render_recent_study_sessions()
 
 
 def today_task_summary():
@@ -3320,8 +3682,9 @@ def render_daily_review():
     st.subheader("Daily Review")
     render_today_task_summary()
     render_daily_review_form()
-    render_daily_review_export()
-    render_recent_daily_reviews()
+    with st.expander("Export and Recent Reviews", expanded=False):
+        render_daily_review_export()
+        render_recent_daily_reviews()
 
 
 def render_agent_memory_info():
@@ -3506,6 +3869,12 @@ def render_advanced_choice(choice):
 
 
 def main():
+    st.set_page_config(
+        page_title="Student Task Manager",
+        page_icon="ST",
+        layout="centered",
+    )
+    inject_calm_command_css()
     st.title("Student Task Manager")
 
     init_db()
