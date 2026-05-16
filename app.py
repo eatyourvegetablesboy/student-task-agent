@@ -10,6 +10,13 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 
 from action_engine import build_confirmable_actions, count_ready_actions
+from ai_chat import (
+    AIChatConfigError,
+    AIChatResponseError,
+    build_chat_context,
+    generate_chat_response,
+    has_openai_api_key as has_ai_chat_api_key,
+)
 from ai_boss import (
     AIBossConfigError,
     AIBossResponseError,
@@ -54,6 +61,7 @@ from question_coach import (
 )
 from db import (
     archive_course,
+    clear_chat_history,
     complete_study_session,
     create_agent_memory,
     create_agent_memory_candidate,
@@ -72,6 +80,7 @@ from db import (
     get_active_study_session,
     get_active_agent_memory,
     get_all_tasks,
+    get_recent_chat_messages,
     get_checkin_answers_by_date,
     get_daily_review_by_date,
     get_daily_command_review_by_command,
@@ -100,6 +109,7 @@ from db import (
     promote_candidate_to_task,
     rescore_all_active_tasks,
     save_daily_command,
+    save_chat_message,
     save_ai_boss_briefing,
     create_or_update_daily_command_review,
     mark_command_center_message_applied,
@@ -122,6 +132,7 @@ EXPORT_DIR = BASE_DIR / "data" / "exports"
 LOCAL_TIMEZONE = ZoneInfo("America/Toronto")
 
 MAIN_MENU_OPTIONS = [
+    "AI Boss Chat",
     "Today",
     "Focus",
     "Review",
@@ -447,6 +458,46 @@ def inject_calm_command_css():
             color: var(--text-muted);
             font-size: 0.86rem;
             margin: 0.25rem 0 0.75rem;
+        }
+
+        .chat-shell {
+            min-height: 54vh;
+            padding: 0.25rem 0 1rem;
+        }
+
+        .chat-context-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+            gap: 0.75rem;
+            margin: 0.5rem 0 0.75rem;
+        }
+
+        .chat-context-stat {
+            background: #FFFFFF;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0.75rem;
+        }
+
+        .chat-context-label {
+            color: var(--text-muted);
+            font-size: 0.74rem;
+            font-weight: 750;
+            text-transform: uppercase;
+        }
+
+        .chat-context-value {
+            color: var(--text-main);
+            font-size: 1.25rem;
+            font-weight: 760;
+        }
+
+        .proposed-action-card {
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0.8rem 0.9rem;
+            margin: 0.5rem 0;
+            background: #FFFFFF;
         }
 
         .detail-field {
@@ -776,6 +827,160 @@ def show_pending_message():
     message = st.session_state.pop("status_update_message", None)
     if message:
         st.success(message)
+
+
+def parse_json_object(value):
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def render_chat_context_summary(context):
+    counts = context.get("counts", {})
+    visible_counts = [
+        ("Active tasks", counts.get("active_tasks", 0)),
+        ("Urgent context", counts.get("top_urgent_tasks", 0)),
+        ("Pending candidates", counts.get("pending_candidates", 0)),
+        ("Focus sessions", counts.get("recent_study_sessions", 0)),
+        ("Daily reviews", counts.get("recent_daily_reviews", 0)),
+        ("Memories", counts.get("active_memories", 0)),
+    ]
+    stat_html = "".join(
+        (
+            '<div class="chat-context-stat">'
+            f'<div class="chat-context-label">{escape_html(label)}</div>'
+            f'<div class="chat-context-value">{escape_html(value)}</div>'
+            '</div>'
+        )
+        for label, value in visible_counts
+    )
+    st.markdown(
+        f'<div class="chat-context-row">{stat_html}</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "The chat receives compact task, focus, review, and memory summaries. "
+        "It does not receive full PDFs, raw Quercus JSON, or the whole database."
+    )
+
+
+def render_proposed_actions(actions):
+    if not actions:
+        return
+
+    st.markdown("**Proposed Actions**")
+    for index, action in enumerate(actions, start=1):
+        args_preview = json.dumps(
+            action.get("args") or {},
+            ensure_ascii=False,
+            indent=2,
+        )
+        st.markdown(
+            (
+                '<div class="proposed-action-card">'
+                f'<div class="detail-label">Proposed action {index}</div>'
+                f'<div class="detail-value"><strong>{escape_html(action.get("action_type"))}</strong>'
+                f' | risk: {escape_html(action.get("risk_level"))}'
+                f' | confirmation: {escape_html(action.get("requires_confirmation"))}</div>'
+                '</div>'
+            ),
+            unsafe_allow_html=True,
+        )
+        st.code(args_preview, language="json")
+        st.caption("Action execution is not enabled yet. This is a proposal only.")
+
+
+def render_chat_questions(questions):
+    if not questions:
+        return
+
+    st.markdown("**Questions**")
+    for question in questions:
+        st.write(f"- {question}")
+
+
+def render_ai_boss_chat_message(message):
+    metadata = parse_json_object(message.get("metadata_json"))
+    role = message.get("role")
+    chat_role = role if role in ("user", "assistant") else "assistant"
+    with st.chat_message(chat_role):
+        st.write(message.get("content"))
+        if role == "assistant":
+            render_proposed_actions(metadata.get("proposed_actions") or [])
+            render_chat_questions(metadata.get("questions") or [])
+
+
+def render_ai_boss_chat():
+    st.markdown("## AI Boss Chat")
+    st.caption("Talk to the execution manager. MVP-16A is read-only: it can propose actions, but it cannot execute them.")
+
+    key_present = has_ai_chat_api_key()
+    if not key_present:
+        st.warning("Add OPENAI_API_KEY to your .env file to use AI Boss Chat.")
+
+    context = build_chat_context()
+    with st.expander("Context used by AI", expanded=False):
+        render_chat_context_summary(context)
+
+    messages = get_recent_chat_messages(limit=30)
+    st.markdown('<div class="chat-shell">', unsafe_allow_html=True)
+    if not messages:
+        with st.chat_message("assistant"):
+            st.write(
+                "Tell me what is happening today: deadlines, energy, time, blockers, "
+                "or what you are avoiding. I will give a direct next action and "
+                "propose changes for later confirmation."
+            )
+    else:
+        for message in messages:
+            render_ai_boss_chat_message(message)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    with st.expander("Clear Chat History", expanded=False):
+        st.warning("This deletes local chat messages only. It does not delete tasks, reviews, memories, or Quercus data.")
+        confirm_clear = st.checkbox("I understand this will clear local chat history.")
+        if st.button("Clear Chat History", disabled=not confirm_clear):
+            deleted = clear_chat_history()
+            st.success(f"Cleared {deleted} chat messages.")
+            st.rerun()
+
+    message = st.chat_input(
+        "Ask AI Boss what to do next...",
+        disabled=not key_present,
+    )
+    if not message:
+        return
+
+    save_chat_message("user", message)
+    recent_messages = get_recent_chat_messages(limit=30)
+    context = build_chat_context()
+
+    with st.spinner("AI Boss is reading the local context..."):
+        try:
+            response = generate_chat_response(message, recent_messages, context)
+        except (AIChatConfigError, ValueError) as error:
+            st.error(str(error))
+            return
+        except AIChatResponseError as error:
+            st.error(str(error))
+            if error.raw_response:
+                st.text_area("Raw AI response", value=error.raw_response, height=220)
+            return
+        except Exception as error:
+            st.error(f"Could not generate chat response: {error}")
+            return
+
+    metadata = {
+        "proposed_actions": response.get("proposed_actions") or [],
+        "questions": response.get("questions") or [],
+        "context_counts": context.get("counts", {}),
+    }
+    save_chat_message("assistant", response.get("message"), metadata=metadata)
+    st.rerun()
 
 
 def render_task_fields(task):
@@ -4301,7 +4506,9 @@ def main():
 
     choice = st.sidebar.radio("Menu", MAIN_MENU_OPTIONS, label_visibility="collapsed")
 
-    if choice == "Today":
+    if choice == "AI Boss Chat":
+        render_ai_boss_chat()
+    elif choice == "Today":
         render_command_center()
     elif choice == "Focus":
         render_focus_session()

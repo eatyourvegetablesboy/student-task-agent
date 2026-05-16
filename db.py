@@ -446,6 +446,18 @@ def _create_command_center_messages_table(cursor):
     ''')
 
 
+def _create_chat_messages_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
+            content TEXT NOT NULL,
+            metadata_json TEXT,
+            created_at TEXT
+        )
+    ''')
+
+
 def _create_daily_refresh_runs_table(cursor):
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS daily_refresh_runs (
@@ -815,6 +827,7 @@ def init_db():
         _create_agent_memory_candidates_table(cursor)
         _create_checkin_answers_table(cursor)
         _create_command_center_messages_table(cursor)
+        _create_chat_messages_table(cursor)
         _create_daily_refresh_runs_table(cursor)
         conn.commit()
 
@@ -829,6 +842,7 @@ def init_db():
     init_agent_memory_candidates_table(create_backup=False)
     init_checkin_answers_table(create_backup=False)
     init_command_center_messages_table(create_backup=False)
+    init_chat_messages_table(create_backup=False)
     init_daily_refresh_runs_table(create_backup=False)
     score_unscored_active_tasks()
 
@@ -1042,6 +1056,24 @@ def init_command_center_messages_table(create_backup=True):
     with closing(_connect()) as conn:
         cursor = conn.cursor()
         _create_command_center_messages_table(cursor)
+        conn.commit()
+
+
+def init_chat_messages_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            missing = not _table_exists(cursor, "chat_messages")
+
+    if missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_chat_messages_table(cursor)
         conn.commit()
 
 
@@ -2350,6 +2382,63 @@ def get_recent_command_center_messages(message_date=None, limit=20):
             (*params, limit),
         )
         return [dict(row) for row in cursor.fetchall()]
+
+
+def save_chat_message(role, content, metadata=None):
+    role = _clean_review_text(role)
+    if role not in ("user", "assistant", "system", "tool"):
+        raise ValueError("Chat message role must be user, assistant, system, or tool.")
+
+    content = _clean_review_text(content)
+    if not content:
+        raise ValueError("Chat message content is required.")
+
+    metadata_json = None
+    if metadata:
+        metadata_json = json.dumps(metadata, ensure_ascii=False)
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO chat_messages (
+                role, content, metadata_json, created_at
+            ) VALUES (?, ?, ?, ?)
+            ''',
+            (role, content, metadata_json, now),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_recent_chat_messages(limit=30):
+    limit = max(1, int(limit))
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, role, content, metadata_json, created_at
+            FROM (
+                SELECT id, role, content, metadata_json, created_at
+                FROM chat_messages
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+            )
+            ORDER BY created_at ASC, id ASC
+            ''',
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def clear_chat_history():
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM chat_messages")
+        deleted = cursor.rowcount
+        conn.commit()
+        return deleted
 
 
 def create_or_update_daily_refresh_run(refresh):
