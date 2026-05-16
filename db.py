@@ -2432,6 +2432,22 @@ def get_recent_chat_messages(limit=30):
         return [dict(row) for row in cursor.fetchall()]
 
 
+def update_chat_message_metadata(message_id, metadata):
+    metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE chat_messages
+            SET metadata_json = ?
+            WHERE id = ?
+            ''',
+            (metadata_json, int(message_id)),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
 def clear_chat_history():
     with closing(_connect()) as conn:
         cursor = conn.cursor()

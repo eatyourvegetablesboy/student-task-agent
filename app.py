@@ -116,6 +116,7 @@ from db import (
     promote_memory_candidate_to_memory,
     unarchive_course,
     update_agent_memory_candidate_decision,
+    update_chat_message_metadata,
     update_task_behavior_fields,
     update_personal_commitment_status,
     update_task_candidate_decision,
@@ -839,6 +840,229 @@ def parse_json_object(value):
     return parsed if isinstance(parsed, dict) else {}
 
 
+def chat_action_id(action):
+    raw = json.dumps(action or {}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def chat_action_args(action):
+    args = (action or {}).get("args") or {}
+    return args if isinstance(args, dict) else {}
+
+
+def chat_int(value, default=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def chat_priority(value):
+    if isinstance(value, str):
+        mapped = {
+            "highest": 5,
+            "high": 5,
+            "medium": 3,
+            "normal": 3,
+            "low": 1,
+            "lowest": 1,
+        }.get(value.strip().lower())
+        if mapped:
+            return mapped
+    return max(1, min(5, chat_int(value, 3)))
+
+
+def find_chat_task(args):
+    task_id = args.get("task_id") or args.get("id")
+    tasks = get_all_tasks()
+    if task_id not in (None, ""):
+        for task in tasks:
+            if str(task.get("id")) == str(task_id):
+                return task
+        raise ValueError(f"Task id {task_id} was not found.")
+
+    title = (args.get("title") or args.get("task_title") or "").strip().casefold()
+    if not title:
+        raise ValueError("The action needs a task_id or exact title.")
+
+    matches = [
+        task for task in tasks
+        if (task.get("title") or "").strip().casefold() == title
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ValueError("Multiple tasks matched that title. Ask AI Boss to use task_id.")
+    raise ValueError("No task matched that title.")
+
+
+def apply_chat_create_task(args):
+    title = display_value(args.get("title")).strip()
+    if not title or title == "-":
+        raise ValueError("create_task requires a title.")
+
+    status = args.get("status")
+    if status not in ("suggested", "confirmed", "in_progress"):
+        status = "suggested"
+
+    task_id = create_task({
+        "title": title,
+        "course": args.get("course"),
+        "task_type": args.get("task_type") or args.get("type") or "task",
+        "due_at": args.get("due_at"),
+        "planned_date": args.get("planned_date"),
+        "estimated_minutes": chat_int(args.get("estimated_minutes")),
+        "priority": chat_priority(args.get("priority")),
+        "status": status,
+        "source": args.get("source") or "ai_boss_chat",
+        "confidence": args.get("confidence") or "medium",
+        "notes": args.get("notes"),
+        "source_snippet": args.get("source_snippet"),
+        "needs_review": 1 if status == "suggested" else 0,
+    })
+    return f"Created {status} task #{task_id}: {title}"
+
+
+def apply_chat_update_task_status(args):
+    task = find_chat_task(args)
+    status = args.get("status") or args.get("new_status") or args.get("suggested_status")
+    if status not in ("suggested", "confirmed", "ignored", "in_progress", "done"):
+        raise ValueError("update_task_status requires a valid status.")
+    update_task_status(task["id"], status)
+    return f"Updated '{task['title']}' to {status}."
+
+
+def apply_chat_start_focus_session(args):
+    if get_active_study_session():
+        return "Skipped: a focus session is already active."
+
+    task = find_chat_task(args)
+    planned_minutes = chat_int(args.get("planned_minutes"), 25)
+    start_focus_session_for_task(task, planned_minutes=max(1, planned_minutes))
+    return f"Started a {planned_minutes}-minute focus session for '{task['title']}'."
+
+
+def apply_chat_end_focus_session(args):
+    active_session = get_active_study_session()
+    if not active_session:
+        return "Skipped: there is no active focus session."
+
+    completion_status = args.get("completion_status") or "partial"
+    if completion_status not in ("completed", "partial", "not_completed", "blocked"):
+        completion_status = "partial"
+    completed_session = complete_study_session(
+        active_session["id"],
+        completion_status,
+        args.get("blocker"),
+        args.get("notes"),
+    )
+    task_id = completed_session.get("task_id")
+    if task_id and completion_status == "completed":
+        update_task_status(task_id, "done")
+    elif task_id and completion_status in ("partial", "blocked"):
+        update_task_status(task_id, "in_progress")
+    return f"Ended focus session as {completion_status}."
+
+
+def apply_chat_daily_review(args):
+    review_date = args.get("review_date") or date.today().isoformat()
+    create_or_update_daily_review({
+        "review_date": review_date,
+        "completed_summary": args.get("completed_summary"),
+        "missed_tasks": args.get("missed_tasks"),
+        "blockers": args.get("blockers"),
+        "avoidance_notes": args.get("avoidance_notes"),
+        "tomorrow_top_priority": args.get("tomorrow_top_priority"),
+        "mood_energy": args.get("mood_energy") or "medium",
+        "focus_rating": chat_int(args.get("focus_rating"), 3),
+    })
+    return f"Saved daily review for {review_date}."
+
+
+def apply_chat_agent_memory(args):
+    memory_id = create_agent_memory({
+        "memory_type": args.get("memory_type") or "other",
+        "memory_key": args.get("memory_key") or args.get("key"),
+        "memory_value": args.get("memory_value") or args.get("value"),
+        "confidence": args.get("confidence") or "medium",
+        "source": args.get("source") or "ai_boss_chat",
+    })
+    return f"Saved agent memory #{memory_id}."
+
+
+def apply_chat_ai_boss_briefing():
+    current_date = date.today().isoformat()
+    tasks = get_all_tasks()
+    context = build_ai_boss_context(
+        tasks=tasks,
+        today_plan=generate_today_plan(tasks),
+        recent_study_sessions=get_recent_study_sessions(limit=20),
+        recent_daily_reviews=get_recent_daily_reviews(limit=7),
+        active_memories=get_active_agent_memory(),
+        current_date=current_date,
+    )
+    briefing = generate_ai_boss_briefing(context)
+    raw_response = briefing.get("_raw_response")
+    briefing_for_save = {
+        key: value for key, value in briefing.items()
+        if key != "_raw_response"
+    }
+    save_ai_boss_briefing(
+        briefing_date=current_date,
+        input_summary_json=json.dumps(context, ensure_ascii=False),
+        output_json=json.dumps(briefing_for_save, ensure_ascii=False),
+        raw_response=raw_response,
+    )
+    return "Generated and saved a new AI Boss briefing."
+
+
+def execute_chat_action(action):
+    action_type = (action or {}).get("action_type")
+    args = chat_action_args(action)
+    try:
+        if action_type == "create_task":
+            message = apply_chat_create_task(args)
+        elif action_type == "update_task_status":
+            message = apply_chat_update_task_status(args)
+        elif action_type == "run_task_intake":
+            summary = run_auto_task_intake()
+            message = (
+                "Ran Task Intake: "
+                f"{summary.get('confirmed_tasks_auto_created', 0)} confirmed, "
+                f"{summary.get('pending_candidates_created', 0)} pending, "
+                f"{summary.get('tasks_updated', 0)} updated."
+            )
+        elif action_type == "run_quercus_sync":
+            record = run_daily_quercus_refresh(trigger_source="ai_boss_chat")
+            message = f"Ran Quercus refresh: {record.get('status')}."
+        elif action_type == "start_focus_session":
+            message = apply_chat_start_focus_session(args)
+        elif action_type == "end_focus_session":
+            message = apply_chat_end_focus_session(args)
+        elif action_type == "save_daily_review":
+            message = apply_chat_daily_review(args)
+        elif action_type == "create_agent_memory":
+            message = apply_chat_agent_memory(args)
+        elif action_type == "generate_ai_boss_briefing":
+            message = apply_chat_ai_boss_briefing()
+        else:
+            return {
+                "status": "skipped",
+                "message": f"Unsupported action type: {display_value(action_type)}",
+            }
+    except Exception as error:
+        return {
+            "status": "error",
+            "message": str(error),
+        }
+
+    return {
+        "status": "applied",
+        "message": message,
+        "applied_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 def render_chat_context_summary(context):
     counts = context.get("counts", {})
     visible_counts = [
@@ -868,12 +1092,15 @@ def render_chat_context_summary(context):
     )
 
 
-def render_proposed_actions(actions):
+def render_proposed_actions(message_id, metadata, actions):
     if not actions:
         return
 
+    action_results = metadata.get("action_results") or {}
     st.markdown("**Proposed Actions**")
     for index, action in enumerate(actions, start=1):
+        action_id = chat_action_id(action)
+        result = action_results.get(action_id)
         args_preview = json.dumps(
             action.get("args") or {},
             ensure_ascii=False,
@@ -891,7 +1118,29 @@ def render_proposed_actions(actions):
             unsafe_allow_html=True,
         )
         st.code(args_preview, language="json")
-        st.caption("Action execution is not enabled yet. This is a proposal only.")
+        if result:
+            status = result.get("status")
+            message = result.get("message")
+            if status == "applied":
+                st.success(message)
+            elif status == "error":
+                st.error(message)
+            else:
+                st.info(message)
+            continue
+
+        st.caption("Nothing happens until you confirm this action.")
+        if st.button(
+            "Confirm and Execute",
+            key=f"chat-action-{message_id}-{action_id}",
+        ):
+            result = execute_chat_action(action)
+            updated_metadata = dict(metadata)
+            updated_results = dict(action_results)
+            updated_results[action_id] = result
+            updated_metadata["action_results"] = updated_results
+            update_chat_message_metadata(message_id, updated_metadata)
+            st.rerun()
 
 
 def render_chat_questions(questions):
@@ -910,7 +1159,11 @@ def render_ai_boss_chat_message(message):
     with st.chat_message(chat_role):
         st.write(message.get("content"))
         if role == "assistant":
-            render_proposed_actions(metadata.get("proposed_actions") or [])
+            render_proposed_actions(
+                message.get("id"),
+                metadata,
+                metadata.get("proposed_actions") or [],
+            )
             render_chat_questions(metadata.get("questions") or [])
 
 
